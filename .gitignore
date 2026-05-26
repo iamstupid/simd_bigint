@@ -1,0 +1,11 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.gcda
+*.gcno
+compile_commands.json
