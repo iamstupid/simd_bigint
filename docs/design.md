@@ -8,7 +8,8 @@ from the beginning.
 ## Goals
 
 - First-class AVX-512 implementation, especially IFMA/VBMI/VBMI2/BW/VL.
-- Keep the public binary representation simple and stable.
+- Keep the public low-level ABI simple: unsigned limb pointers plus explicit
+  sizes.
 - Use SIMD-native temporary formats instead of forcing every kernel through
   `u64` limb arithmetic.
 - Make multiplication decisions from the actual operand shape, not from a
@@ -24,47 +25,50 @@ from the beginning.
 - A high-level `mpz` replacement before the low-level kernels are correct.
 - Constant-time cryptographic behavior in the first arithmetic kernels.
 
-## Public Binary Format
+## Low-Level Data Model
 
-The external integer format is:
+The low-level library should work like GMP's `mpn` layer: it operates directly
+on unsigned magnitude arrays, not on signed bigint objects.
 
 ```c
-typedef struct sb_int {
-    uint64_t *limbs;
-    int64_t limb_size;
-} sb_int;
+typedef uint64_t sb_limb_t;
+typedef int64_t sb_size_t;
+
+typedef sb_limb_t *sb_ptr;
+typedef const sb_limb_t *sb_srcptr;
+```
+
+Operands are passed as pointer-plus-length pairs:
+
+```c
+sb_add_n(rp, ap, bp, n);
+sb_mul(rp, ap, an, bp, bn);
 ```
 
 `limbs` is little-endian: `limbs[0]` is the least significant limb.
 
-`limb_size` is not a two's-complement signed length.  Its top bit is the sign
-bit and the remaining low 63 bits are the absolute limb count:
+All low-level arithmetic is unsigned.  Signed integers, sign/magnitude object
+wrappers, allocation policy, and canonical object normalization belong above
+this layer.
 
-```c
-sign = (uint64_t)limb_size >> 63;
-size = (uint64_t)limb_size & INT64_MAX;
-```
-
-The magnitude is not stored in two's complement.  Negative numbers have the
-same limb array as their absolute value, with only the sign bit set in
-`limb_size`.
-
-Canonical zero has `limb_size == 0`.  Negative zero is invalid.
+This removes sign extension from hot kernels and keeps multiplication,
+division, Toom splitting, FFT, and NTT working on plain magnitudes.
 
 ## Normalization Invariants
 
-- `size == 0` means the value is zero and `limbs` may be null.
-- If `size > 0`, `limbs[size - 1] != 0`.
+For a normalized public magnitude:
+
+- `n == 0` means zero and the limb pointer may be null.
+- If `n > 0`, `ap[n - 1] != 0`.
 - The exact bit length is:
 
 ```c
-bitlen = size * 64 - clz64(limbs[size - 1]);
+bitlen = n * 64 - clz64(ap[n - 1]);
 ```
 
-- Public API entry points may accept non-normalized temporaries only when
-  explicitly documented.
-- Kernel-level functions should separate logical operand length from allocated
-  capacity.
+Kernel-level functions may accept fixed-size temporary slices whose top limb is
+zero.  That must be documented per function.  Algorithmic kernels should keep
+logical length, allocated capacity, and scratch length separate.
 
 ## Temporary Internal Formats
 
@@ -116,7 +120,6 @@ Addition/subtraction should have separate kernels for:
 
 - public `u64` limb arrays;
 - internal `u52x8` digit arrays;
-- signed public values using sign/magnitude dispatch;
 - raw magnitude add/sub for multiplication carry propagation.
 
 For `u64x8`, the carry chain should use a mask-based generate/propagate pass:
@@ -130,9 +133,79 @@ For `u64x8`, the carry chain should use a mask-based generate/propagate pass:
 For `u52x8`, the same idea applies with base `2^52`, but the correction must
 wrap modulo `2^52`, not modulo `2^64`.
 
-Subtraction needs the borrow equivalent.  Since the public format is
-sign/magnitude, subtraction at the high level dispatches to magnitude compare
-plus magnitude subtract instead of relying on sign extension.
+Subtraction needs the borrow equivalent.  Low-level subtraction assumes the
+caller has selected the correct larger magnitude when a non-negative result is
+required.  Signed dispatch belongs above this layer.
+
+## Performance-Critical MPN Kernels
+
+The first implementation should not blindly copy every GMP `mpn` entry point.
+The kernels below are the ones that matter for a SIMD-first bigint core.
+
+### u52-Only Internal Kernels
+
+These kernels operate only on temporary base-`2^52` vector arrays.  They should
+not be public ABI unless benchmarking proves a reason to expose them.
+
+- `sb52_carry_normalize`: propagate carries across `u52x8` vectors.
+- `sb52_add_n`, `sb52_sub_n`: vector add/sub for internal Toom and carry work.
+- `sb52_lshift`, `sb52_rshift`: digit and bit shifts inside base `2^52`.
+- `sb52_mul_basecase`: IFMA Comba rectangular multiplication.
+- `sb52_sqr_basecase`: IFMA Comba squaring with symmetry exploitation.
+- `sb52_addmul_1`, `sb52_submul_1`: single-vector multiply accumulation for
+  Toom interpolation and division helpers.
+- `sb52_toom22_mul`, `sb52_toom32_mul`, `sb52_toom42_mul`,
+  `sb52_toom33_mul`: recursive multiplication in decoded form.
+- `sb52_toom_eval_*`, `sb52_toom_interp_*`: evaluation/interpolation helpers
+  that avoid converting back to `u64` between recursive calls.
+- `sb52_divexact_1`, `sb52_divexact_by3`, `sb52_divexact_by5`: exact small
+  constant division for Toom interpolation.
+- `sb52_inv_1_precomp`: reciprocal/preinverse helpers if division starts using
+  decoded arithmetic.
+- `sb52_div_qr_basecase`: optional internal division once multiplication and
+  Toom need reciprocal-based division experiments.
+
+### u64-Only Interface Kernels
+
+These are the exposed pointer-format kernels.  They operate on little-endian
+`uint64_t` limbs and define the stable low-level ABI.
+
+- `sb_copyi`, `sb_copyd`, `sb_zero`: overlap-aware copy and zeroing.
+- `sb_normalized_size`: trim leading zero limbs.
+- `sb_bitlen`: exact bit length using the top limb `clz`.
+- `sb_cmp`, `sb_cmp_n`, `sb_zero_p`: magnitude comparison and zero tests.
+- `sb_add_1`, `sb_sub_1`: add/subtract one limb.
+- `sb_mul_1`: public multiply by one limb.
+- `sb_div_qr_1`, `sb_mod_1`, `sb_preinv_div_qr_1`: public single-limb
+  division and remainder.
+- `sb_invert_limb`: reciprocal helper for division.
+- `sb_get/set` helpers for bytes, if import/export becomes part of this layer.
+
+### Kernels Needed In Both u64 And u52 Forms
+
+These operations are performance-critical at the public boundary and inside
+decoded multiplication/Toom.  They need separate implementations for each
+representation, not one generic abstraction.
+
+- `add_n`, `add`: vectorized addition with carry-out.
+- `sub_n`, `sub`: vectorized subtraction with borrow-out.
+- `lshift`, `rshift`: bit shifts with carry bits across limbs/digits.
+- `addmul_1`, `submul_1`: core building blocks for basecase, division, and
+  interpolation.
+- `decode_blocks`, `pack_blocks`: `u64 <-> u52x8` conversion at algorithm
+  boundaries.
+- `mul_basecase`: scalar/`u64` tiny kernels and IFMA/`u52` kernels.
+- `sqr_basecase`: tiny scalar squaring and IFMA/`u52` squaring.
+- `mul`, `mul_n`, `sqr`: public `u64` entry points with internal dispatch to
+  scalar, `u52`, FFT, or NTT implementations.
+- `toom*_mul`: public `u64` entry points that may immediately decode and then
+  recurse in `u52`.
+- `div_qr_basecase`: public `u64` division plus possible `u52` reciprocal
+  experiments.
+- `carry_normalize`: public `u64` result normalization and internal `u52`
+  carry propagation.
+- `scan/cmp high limbs`: top-limb search and compare logic for dispatch,
+  normalization, and division.
 
 ## Multiplication Plan
 
@@ -257,8 +330,9 @@ src/x86_64/znver5/
 
 ## Design Choices To Solve
 
-- Should the public `limb_size` type remain `int64_t`, or should the ABI use
-  `uint64_t` while preserving the top-bit sign encoding?
+- Should the size type be signed like GMP's `mp_size_t` for compatibility with
+  local conventions, or unsigned because this layer has no signed object
+  lengths?
 - How much normalization is required at public API boundaries?
 - What is the exact borrow propagation algorithm for `u64x8` subtraction?
 - What is the exact carry/borrow propagation algorithm for `u52x8` after IFMA
@@ -271,7 +345,8 @@ src/x86_64/znver5/
 - Where should Duff-style tail dispatch live so full-vector hot paths remain
   branch-free?
 - Which scalar tiny kernels deserve handwritten assembly first?
-- How should Toom evaluation/interpolation represent signed temporary values?
+- How should Toom evaluation/interpolation represent negative temporary values
+  without leaking signed object semantics into the public ABI?
 - Which Toom variants should be implemented before FFT becomes worthwhile?
 - How should recursive Toom scratch be laid out to avoid repeated decoding and
   unnecessary writes?
