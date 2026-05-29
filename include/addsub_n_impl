@@ -1,0 +1,63 @@
+inline static uint8_t _MPN_ADDSUB_N(plimb r, plimb a, plimb b, uint64_t n,
+                                uint8_t carry) {
+  _vec r0, r1, r2, r3, a0, a1, a2, a3, b0, b1, b2, b3;
+  uint64_t p, cnt;
+  __mmask8 m;
+small:
+  if (n > 3)  goto big1;
+rtail:
+  carry = ADDSUB(carry, a[0], b[0], r);
+  if (n == 1) return carry;
+  carry = ADDSUB(carry, a[1], b[1], r + 1);
+  if (n == 2) return carry;
+  return  ADDSUB(carry, a[2], b[2], r + 2);
+big1:
+  if (n > 7) goto big2;
+ctail:
+  m = (1 << n) - 1;
+  a0 = load_vec(a, m); b0 = load_vec(b, m);
+  FLEX_add_step_u64_vec(r0, a0, b0, carry, n);
+  store_vec(r, r0, m);
+  return carry;
+big2:
+  if (n > 15) goto big3;
+  a0 = load_vec(a); b0 = load_vec(b);
+  FLEX_add_step_u64_vec(r0, a0, b0, carry, 8);
+  store_vec(r, r0);
+  if (n == 8) return carry;
+  a += 8, b += 8, r += 8, n -= 8;
+  if (n & 4) goto ctail;
+  else goto rtail;
+big3:
+  p = n;
+  n = p & 15;
+  cnt = p >> 5;
+  plimb rd1, rd2, rd3;
+  if (p & 16) { // 2
+    a2 = load_vec(a), a3 = load_vec(a + 8);
+    b2 = load_vec(b), b3 = load_vec(b + 8);
+    rd2 = r, rd3 = r + 8;
+    r += 16, a += 16, b += 16;
+    goto start2;
+  }
+  for (; cnt;) {
+  loop:
+    --cnt;
+    a0 = load_vec(a), a1 = load_vec(a + 8), a2 = load_vec(a + 16), a3 = load_vec(a + 24);
+    b0 = load_vec(b), b1 = load_vec(b + 8), b2 = load_vec(b + 16), b3 = load_vec(b + 24);
+    rd1 = r + 8, rd2 = r + 16, rd3 = r + 24;
+    a += 32, b += 32;
+    FLEX_add_step_u64_vec(r0, a0, b0, carry, 8);
+    store_vec(r, r0);
+    r += 32;
+    FLEX_add_step_u64_vec(r1, a1, b1, carry, 8);
+    store_vec(rd1, r1);
+  start2:
+    FLEX_add_step_u64_vec(r2, a2, b2, carry, 8);
+    store_vec(rd2, r2);
+    FLEX_add_step_u64_vec(r3, a3, b3, carry, 8);
+    store_vec(rd3, r3);
+  }
+  if (n == 0) return carry;
+  goto small;
+}

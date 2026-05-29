@@ -1,5 +1,4 @@
-#ifndef SIMD_BIGINT_TYPES_H
-#define SIMD_BIGINT_TYPES_H
+#pragma once
 
 #include <immintrin.h>
 #include <stddef.h>
@@ -48,12 +47,12 @@ typedef vec_dtype *pdvec;
 #define load_vec(...) CAT(load_vec_, NARGS(__VA_ARGS__))(__VA_ARGS__)
 #define load_vec_1(p) vec_fn(vec_loadu_i)((const void *)(p))
 #define load_vec_2(p, mask)                                                    \
-  vec_fn(maskz_loadu_epi32)((__mmask16)(mask), (const void *)(p))
+  vec_fn(maskz_loadu_epi64)((__mmask8)(mask), (const void *)(p))
 
 #define store_vec(...) CAT(store_vec_, NARGS(__VA_ARGS__))(__VA_ARGS__)
 #define store_vec_2(p, v) vec_fn(vec_storeu_i)((void *)(p), (v))
-#define store_vec_3(p, mask, v)                                                \
-  vec_fn(mask_storeu_epi32)((void *)(p), (__mmask16)(mask), (v))
+#define store_vec_3(p, v, mask)                                                \
+  vec_fn(mask_storeu_epi64)((void *)(p), (__mmask8)(mask), (v))
 
 // Automatically choose raw op, masked op blended with zero vec, or masked op
 // with a src vector, based on paramater list length
@@ -92,8 +91,7 @@ typedef vec_dtype *pdvec;
 #define maxu(a, b, ...) call_mask_fn(max_epu64, (a), (b), ##__VA_ARGS__)
 
 #define maskz(mask, a) vec_fn(maskz_mov_epi64)((__mmask8)(mask), (a))
-#define blend(src, mask, a)                                                    \
-  vec_fn(mask_mov_epi64)((src), (__mmask8)(mask), (a))
+#define blend(src, mask, a) vec_fn(mask_mov_epi64)((src), (__mmask8)(mask), (a))
 #define blend8(mask, off, on)                                                  \
   vec_fn(mask_blend_epi8)((__mmask64)(mask), (off), (on))
 #define blend16(mask, off, on)                                                 \
@@ -122,14 +120,14 @@ typedef vec_dtype *pdvec;
 #define set1_32(x) vec_fn(set1_epi32)((int)(x))
 #define set1_d(x) vec_fn(set1_pd)((double)(x))
 #define setr_64(e0, e1, e2, e3, e4, e5, e6, e7)                                \
-  vec_fn(setr_epi64)((long long)(e0), (long long)(e1), (long long)(e2),         \
-                     (long long)(e3), (long long)(e4), (long long)(e5),         \
+  vec_fn(setr_epi64)((long long)(e0), (long long)(e1), (long long)(e2),        \
+                     (long long)(e3), (long long)(e4), (long long)(e5),        \
                      (long long)(e6), (long long)(e7))
 #define setr_32(e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13,    \
                 e14, e15)                                                      \
-  vec_fn(setr_epi32)((int)(e0), (int)(e1), (int)(e2), (int)(e3), (int)(e4),     \
-                     (int)(e5), (int)(e6), (int)(e7), (int)(e8), (int)(e9),     \
-                     (int)(e10), (int)(e11), (int)(e12), (int)(e13),            \
+  vec_fn(setr_epi32)((int)(e0), (int)(e1), (int)(e2), (int)(e3), (int)(e4),    \
+                     (int)(e5), (int)(e6), (int)(e7), (int)(e8), (int)(e9),    \
+                     (int)(e10), (int)(e11), (int)(e12), (int)(e13),           \
                      (int)(e14), (int)(e15))
 
 // Unsigned epi64 comparisons returning mask8.
@@ -155,26 +153,47 @@ typedef vec_dtype *pdvec;
 #define k64(x) ((__mmask64)(x))
 
 #define kadd(a, b)                                                             \
-  _Generic((a), __mmask8: _kadd_mask8, __mmask16: _kadd_mask16,                \
-           __mmask32: _kadd_mask32, __mmask64: _kadd_mask64)((a), (b))
+  _Generic((a),                                                                \
+      __mmask8: _kadd_mask8,                                                   \
+      __mmask16: _kadd_mask16,                                                 \
+      __mmask32: _kadd_mask32,                                                 \
+      __mmask64: _kadd_mask64)((a), (b))
 #define kand(a, b)                                                             \
-  _Generic((a), __mmask8: _kand_mask8, __mmask16: _kand_mask16,                \
-           __mmask32: _kand_mask32, __mmask64: _kand_mask64)((a), (b))
+  _Generic((a),                                                                \
+      __mmask8: _kand_mask8,                                                   \
+      __mmask16: _kand_mask16,                                                 \
+      __mmask32: _kand_mask32,                                                 \
+      __mmask64: _kand_mask64)((a), (b))
 #define kandn(a, b)                                                            \
-  _Generic((a), __mmask8: _kandn_mask8, __mmask16: _kandn_mask16,              \
-           __mmask32: _kandn_mask32, __mmask64: _kandn_mask64)((a), (b))
+  _Generic((a),                                                                \
+      __mmask8: _kandn_mask8,                                                  \
+      __mmask16: _kandn_mask16,                                                \
+      __mmask32: _kandn_mask32,                                                \
+      __mmask64: _kandn_mask64)((a), (b))
 #define kor(a, b)                                                              \
-  _Generic((a), __mmask8: _kor_mask8, __mmask16: _kor_mask16,                  \
-           __mmask32: _kor_mask32, __mmask64: _kor_mask64)((a), (b))
+  _Generic((a),                                                                \
+      __mmask8: _kor_mask8,                                                    \
+      __mmask16: _kor_mask16,                                                  \
+      __mmask32: _kor_mask32,                                                  \
+      __mmask64: _kor_mask64)((a), (b))
 #define kxor(a, b)                                                             \
-  _Generic((a), __mmask8: _kxor_mask8, __mmask16: _kxor_mask16,                \
-           __mmask32: _kxor_mask32, __mmask64: _kxor_mask64)((a), (b))
+  _Generic((a),                                                                \
+      __mmask8: _kxor_mask8,                                                   \
+      __mmask16: _kxor_mask16,                                                 \
+      __mmask32: _kxor_mask32,                                                 \
+      __mmask64: _kxor_mask64)((a), (b))
 #define kxnor(a, b)                                                            \
-  _Generic((a), __mmask8: _kxnor_mask8, __mmask16: _kxnor_mask16,              \
-           __mmask32: _kxnor_mask32, __mmask64: _kxnor_mask64)((a), (b))
+  _Generic((a),                                                                \
+      __mmask8: _kxnor_mask8,                                                  \
+      __mmask16: _kxnor_mask16,                                                \
+      __mmask32: _kxnor_mask32,                                                \
+      __mmask64: _kxnor_mask64)((a), (b))
 #define knot(a)                                                                \
-  _Generic((a), __mmask8: _knot_mask8, __mmask16: _knot_mask16,                \
-           __mmask32: _knot_mask32, __mmask64: _knot_mask64)(a)
+  _Generic((a),                                                                \
+      __mmask8: _knot_mask8,                                                   \
+      __mmask16: _knot_mask16,                                                 \
+      __mmask32: _knot_mask32,                                                 \
+      __mmask64: _knot_mask64)(a)
 
 #define klsh(a, imm)                                                           \
   _Generic((a),                                                                \
@@ -199,7 +218,8 @@ typedef vec_dtype *pdvec;
   vec_fn(mask_alignr_epi8)((src), (__mmask64)(mask), (a), (b), (imm))
 #define lane_lsh(a, n) alignr64((a), zero(), 8 - (n))
 #define lane_rsh(a, n) alignr64(zero(), (a), (n))
-#define shuffle8(a, idx, ...) call_mask_fn(shuffle_epi8, (a), (idx), ##__VA_ARGS__)
+#define shuffle8(a, idx, ...)                                                  \
+  call_mask_fn(shuffle_epi8, (a), (idx), ##__VA_ARGS__)
 #define perm64(idx, a) vec_fn(permutexvar_epi64)((idx), (a))
 #define perm32(idx, a) vec_fn(permutexvar_epi32)((idx), (a))
 #define permb(idx, a) vec_fn(permutexvar_epi8)((idx), (a))
@@ -240,4 +260,8 @@ typedef vec_dtype *pdvec;
 #define madd52lo1(acc, a, x) madd52lo((acc), (a), set1_64(x))
 #define madd52hi1(acc, a, x) madd52hi((acc), (a), set1_64(x))
 
-#endif
+#define adc(carry, a, b, r)                                                    \
+  _addcarry_u64((carry), (a), (b), (unsigned long long *)(r))
+
+#define sbb(carry, a, b, r)                                                    \
+  _subborrow_u64((carry), (a), (b), (unsigned long long *)(r))

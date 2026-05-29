@@ -1,0 +1,47 @@
+Design for mixed scalar vector kernel:
+
+idiom:
+
+1. Representation order: LSB ===> MSB
+2. 1 vector = 6.5 limbs (13 half-limbs)
+3. v for vector part, s for scalar part. So v = n*6.5 limbs, s <= 6 limbs
+
+## Base case
+
+It is easy for basecase multiplication.
+
+A = [vA] [sA]
+B = [vB] [sB]
+
+vA*vB, vA * sB, vB * sA are efficiently supported by vector arithmetics, left sA * sB multiplication, where we do by calling the <= 6x6 kernel.
+
+Also, sA * sB is at the most significant part, so we comfortably put the work after all vector multiplication work.
+
+In scratch memory, we do entire A, B -> u52 arrays. This aids sA*vB, sB*vA multiplications. We do sA*sB on the result buffer directly.
+
+## Toom-Cook
+
+It's essentially the same. For internal splits, we always align to vector boundary.
+
+So when we do
+
+A = [vA0] [vA1] [sA1]
+B = [vB0] [vB1] [sB1]
+
+we assume |vA1| + |sA1| <= |vA0|. Same for B.
+
+Then we have to compute
+
+vA0 * vB0, (vA0 - vA1sA1) * (vB0 - vB1sB1), vA1sA1 * vB1sB1
+
+The first two multiplications have lengths of entire vectors, so nothing special. For vA1sA1 _ vB1sB1, we can also omit computing sA1 _ sB1,
+in fact we omit this part of the sum in all layers of recursive toom-cook; only add it back from the outermost I/O routine. I.E.
+
+mul_tc(...){
+    scratch_A = to_u52(A)
+    scratch_B = to_u52(B)
+    scratch_R;
+    recursive_toom_cool(scratch_R, scratch_A, scratch_B, scratch);
+    R = to_u64(scratch_R);
+    mul(R+high_a+high_b, A+high_a, B+high_b, an - high_a, bn - high_b);
+}
