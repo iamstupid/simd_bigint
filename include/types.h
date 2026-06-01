@@ -34,6 +34,7 @@ typedef vec_itype _vec;
 typedef vec_itype *pvec;
 typedef vec_dtype _dvec;
 typedef vec_dtype *pdvec;
+typedef const vec_itype* cpvec;
 
 #define vec_castpd_i CAT(castpd_, vec_int_token)
 #define vec_casti_pd CAT3(cast, vec_int_token, _pd)
@@ -116,6 +117,7 @@ typedef vec_dtype *pdvec;
 #define zero() vec_fn(setzero_si512)()
 #define dzero() vec_fn(setzero_pd)()
 #define ones() vec_fn(set1_epi64)(-1LL)
+#define splat_load(p, ind) vec_fn(set1_epi64)(((const uint64_t*)(p))[ind])
 #define set1_64(x) vec_fn(set1_epi64)((long long)(x))
 #define set1_32(x) vec_fn(set1_epi32)((int)(x))
 #define set1_d(x) vec_fn(set1_pd)((double)(x))
@@ -218,6 +220,7 @@ typedef vec_dtype *pdvec;
   vec_fn(mask_alignr_epi8)((src), (__mmask64)(mask), (a), (b), (imm))
 #define lane_lsh(a, n) alignr64((a), zero(), 8 - (n))
 #define lane_rsh(a, n) alignr64(zero(), (a), (n))
+#define lane_rotl(a, n) alignr64((a),(a), 8 - (n))
 #define shuffle8(a, idx, ...)                                                  \
   call_mask_fn(shuffle_epi8, (a), (idx), ##__VA_ARGS__)
 #define perm64(idx, a) vec_fn(permutexvar_epi64)((idx), (a))
@@ -257,8 +260,6 @@ typedef vec_dtype *pdvec;
 // Explicit IFMA helpers.
 #define madd52lo(acc, a, b) vec_fn(madd52lo_epu64)((acc), (a), (b))
 #define madd52hi(acc, a, b) vec_fn(madd52hi_epu64)((acc), (a), (b))
-#define madd52lo1(acc, a, x) madd52lo((acc), (a), set1_64(x))
-#define madd52hi1(acc, a, x) madd52hi((acc), (a), set1_64(x))
 
 #define adc(carry, a, b, r)                                                    \
   _addcarry_u64((carry), (a), (b), (unsigned long long *)(r))
