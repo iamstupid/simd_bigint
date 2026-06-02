@@ -121,17 +121,68 @@ inline static void mul_u52_basecase(pvec r, cpvec a, cpvec b, uint64_t an, uint6
     return;
 }
 
-int64_t u52_cmp_and_sub(pvec r, cpvec a, cpvec b, uint64_t na, uint64_t nb){
-    // do a - b; r = b - a if b > a, and there we return - |b - a|.
-    // a and b needs to be canonical; otherwise it is difficult to compare.
-    uint8_t flag = 0;
-    if(na < nb){
-        flag = 1;
-        cpvec t = a; a = b; b = t;
-        uint64_t nt = na; na = nb; nb = nt;
-        goto subs;
+int64_t u52_cmp_and_sub(pvec r, cpvec a, cpvec b, uint64_t na, uint64_t nb) {
+    const _vec mask52 = set1_64((1ull << 52) - 1);  // also "-1 mod 2^52" and the 52-bit mask
+    __mmask16  lbr = 0;                              // borrow carried between vectors
+    uint64_t   i = 0, lnz = 0;
+    uint8_t    lnz_mask = 0;
+
+    cpvec    ap, bp;     // ap = larger operand, bp = smaller
+    uint64_t al, bl;     // last-vector index of each
+    uint8_t  flag;       // 1 => true result a-b is negative (operands swapped)
+
+    // remember the most-significant vector that came out nonzero
+    #define TRACK(v) do {                                       \
+        __mmask16 _tk_nz = neq((v), zero());                    \
+        if (_tk_nz) { lnz = i; lnz_mask = _tk_nz; }             \
+    } while (0)
+
+    // resolve one vector of limbwise difference _vr with own-borrows _br:
+    // ripple cross-lane / cross-vector borrow through lbr, normalize, store, track.
+    #define RESOLVE(vr_in, br_in) do {                          \
+        _vec      _rs_vr = (vr_in);                             \
+        __mmask16 _rs_br = (br_in);                             \
+        __mmask16 _rs_ms = eq(_rs_vr, zero()); /* zeros forward a borrow */ \
+        lbr |= _rs_br << 1;                    /* borrow lands one lane up */ \
+        lbr += _rs_ms;                         /* ripple across zero runs   */ \
+        _rs_ms ^= lbr;                         /* lanes that take a -1       */ \
+        lbr >>= 8;                             /* borrow-out -> next vector  */ \
+        _rs_vr = and_v(add(_rs_vr, mask52, _rs_ms, _rs_vr), mask52); \
+        store_vec(r++, _rs_vr);                                 \
+        TRACK(_rs_vr);                                          \
+    } while (0)
+
+    // ---- orient: choose larger/smaller and the result sign ----
+    --na, --nb;
+    if (na != nb) {
+        int abig = na > nb;
+        ap = abig ? a : b;  bp = abig ? b : a;
+        al = (abig ? na : nb) >> 3;
+        bl = (abig ? nb : na) >> 3;
+        flag = !abig;
+    } else {
+        int cmp = 0;
+        cpvec pa = a + (na >> 3), pb = b + (nb >> 3);
+        for (; pa >= a; --pa, --pb) {
+            _vec va = load_vec(pa), vb = load_vec(pb);
+            if (neq(va, vb)) { cmp = ltu(va, vb) ? -1 : 1; al = bl = (uint64_t)(pa - a); break; }
+        }
+        if (!cmp) return 0;                 // a == b
+        int aGE = cmp > 0;
+        ap = aGE ? a : b;  bp = aGE ? b : a;
+        flag = !aGE;
     }
 
-    subs:
-    
+    // ---- subtract: overlap, then borrow tail, then plain copy ----
+    for (;        i <= bl; ++i) { _vec vr = sub(load_vec(ap + i), load_vec(bp + i));
+                                  RESOLVE(vr, ltu(mask52, vr)); }
+    for (; lbr && i <= al; ++i)   RESOLVE(load_vec(ap + i), 0);
+    for (;        i <= al; ++i) { _vec v = load_vec(ap + i); store_vec(r++, v); TRACK(v); }
+
+    #undef RESOLVE
+    #undef TRACK
+
+    const int64_t len = (int64_t)lnz * 8 + (32 - __builtin_clz((uint32_t)lnz_mask));
+    return flag ? -len : len;
 }
+
