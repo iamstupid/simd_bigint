@@ -88,6 +88,7 @@ typedef const vec_itype* cpvec;
 #define sllv(a, b, ...) call_mask_fn(sllv_epi64, (a), (b), ##__VA_ARGS__)
 #define srli(a, b, ...) call_mask_fn(srli_epi64, (a), (b), ##__VA_ARGS__)
 #define slli(a, b, ...) call_mask_fn(slli_epi64, (a), (b), ##__VA_ARGS__)
+#define srai(a, b, ...) call_mask_fn(srai_epi64, (a), (b), ##__VA_ARGS__)
 #define minu(a, b, ...) call_mask_fn(min_epu64, (a), (b), ##__VA_ARGS__)
 #define maxu(a, b, ...) call_mask_fn(max_epu64, (a), (b), ##__VA_ARGS__)
 

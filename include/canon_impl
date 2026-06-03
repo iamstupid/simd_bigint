@@ -1,0 +1,34 @@
+inline static void _MPN_CANON(pvec a, uint64_t n) {
+  _vec carry_vec = zero();
+  _vec a0, a1, a2, a3;
+  int sigcarry = 0;
+  n += 7;
+  uint64_t cnt = n >> 3; // number of _vecs to process
+  n >>= 5;
+  if(cnt & 1){
+    a0 = load_vec(a);
+    canonize(a0, carry_vec, sigcarry);
+    store_vec(a++, a0);
+  }
+  if(cnt & 2){
+    a0 = load_vec(a); a1 = load_vec(a + 1);
+    canonize(a0, carry_vec, sigcarry);
+    canonize(a1, carry_vec, sigcarry);
+    store_vec(a, a0);
+    store_vec(a + 1, a1);
+    a += 2;
+  }
+  while(n){
+    a0 = load_vec(a); a1 = load_vec(a + 1);
+    a2 = load_vec(a + 2); a3 = load_vec(a + 3);
+    canonize(a0, carry_vec, sigcarry);
+    canonize(a1, carry_vec, sigcarry);
+    canonize(a2, carry_vec, sigcarry);
+    canonize(a3, carry_vec, sigcarry);
+    store_vec(a, a0);
+    store_vec(a + 1, a1);
+    store_vec(a + 2, a2);
+    store_vec(a + 3, a3);
+    a += 4, --n;
+  }
+}
