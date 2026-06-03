@@ -10,4 +10,5 @@
     __mmask16 c = gtu(added, all1); \
     __mmask16 m = eq(added, all1); \
     c = m + (sigcarry | (c << 1)); \
-    m ^= c;
+    m ^= c; \
+    

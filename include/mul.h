@@ -2,7 +2,6 @@
 #include "types.h"
 #include "mul_basecase_le6.h"
 #include "assert.h"
-#include <immintrin.h>
 #include "scratch.h"
 
 #define mul_accum(a, b, ind) {\

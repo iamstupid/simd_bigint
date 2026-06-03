@@ -10,6 +10,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv")
     parser.add_argument("png")
+    parser.add_argument("--ylim", nargs=2, type=float, metavar=("LOW", "HIGH"))
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -39,6 +40,8 @@ def main():
         ax.set_title(shape)
         ax.set_xlabel("an u52 digits")
         ax.set_ylabel("ns / (an * bn)")
+        if args.ylim is not None:
+            ax.set_ylim(args.ylim[0], args.ylim[1])
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=8)
 
