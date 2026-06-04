@@ -32,3 +32,84 @@ inline static void _MPN_CANON(pvec a, uint64_t n) {
     a += 4, --n;
   }
 }
+
+inline static _vec CAT(_MPN_CANON, _c)(pvec a, uint64_t n, _vec carry_vec) {
+  _vec a0, a1, a2, a3;
+  int sigcarry = 0;
+  n += 7;
+  uint64_t cnt = n >> 3; // number of _vecs to process
+  n >>= 5;
+  if(cnt & 1){
+    a0 = load_vec(a);
+    canonize(a0, carry_vec, sigcarry);
+    store_vec(a++, a0);
+  }
+  if(cnt & 2){
+    a0 = load_vec(a); a1 = load_vec(a + 1);
+    canonize(a0, carry_vec, sigcarry);
+    canonize(a1, carry_vec, sigcarry);
+    store_vec(a, a0);
+    store_vec(a + 1, a1);
+    a += 2;
+  }
+  while(n){
+    a0 = load_vec(a); a1 = load_vec(a + 1);
+    a2 = load_vec(a + 2); a3 = load_vec(a + 3);
+    canonize(a0, carry_vec, sigcarry);
+    canonize(a1, carry_vec, sigcarry);
+    canonize(a2, carry_vec, sigcarry);
+    canonize(a3, carry_vec, sigcarry);
+    store_vec(a, a0);
+    store_vec(a + 1, a1);
+    store_vec(a + 2, a2);
+    store_vec(a + 3, a3);
+    a += 4, --n;
+  }
+  return add(carry_vec, set1_64(sigcarry));
+}
+
+inline static _vec CAT(_MPN_CANON, _MPN_ADDSUB)(pvec r, cpvec a, cpvec b, uint64_t n, _vec carry_vec) {
+  _vec r0, r1, r2, r3, a0, a1, a2, a3, b0, b1, b2, b3;
+  n += 7;
+  uint64_t cnt = n >> 3; // number of _vecs to process
+  n >>= 5;
+  int sigcarry = 0;
+  if(cnt & 1){
+    a0 = load_vec(a); b0 = load_vec(b);
+    flex_add(r0, a0, b0);
+    canonize(r0, carry_vec, sigcarry);
+    store_vec(r, r0);
+    ++r, ++a, ++b;
+  }
+  if(cnt & 2){
+    a0 = load_vec(a); b0 = load_vec(b);
+    a1 = load_vec(a + 1); b1 = load_vec(b + 1);
+    flex_add(r0, a0, b0);
+    flex_add(r1, a1, b1);
+    canonize(r0, carry_vec, sigcarry);
+    canonize(r1, carry_vec, sigcarry);
+    store_vec(r, r0);
+    store_vec(r + 1, r1);
+    r += 2, a += 2, b += 2;
+  }
+  while(n){
+    a0 = load_vec(a); b0 = load_vec(b);
+    a1 = load_vec(a + 1); b1 = load_vec(b + 1);
+    a2 = load_vec(a + 2); b2 = load_vec(b + 2);
+    a3 = load_vec(a + 3); b3 = load_vec(b + 3);
+    flex_add(r0, a0, b0);
+    flex_add(r1, a1, b1);
+    flex_add(r2, a2, b2);
+    flex_add(r3, a3, b3);
+    canonize(r0, carry_vec, sigcarry);
+    canonize(r1, carry_vec, sigcarry);
+    canonize(r2, carry_vec, sigcarry);
+    canonize(r3, carry_vec, sigcarry);
+    store_vec(r, r0);
+    store_vec(r + 1, r1);
+    store_vec(r + 2, r2);
+    store_vec(r + 3, r3);
+    r += 4, a += 4, b += 4, --n;
+  }
+  return add(carry_vec, set1_64(sigcarry));
+}
