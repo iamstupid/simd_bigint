@@ -3,6 +3,7 @@
 #include "mul_basecase_le6.h"
 #include "assert.h"
 #include "scratch.h"
+#include "canon.h"
 
 #define mul_accum(a, b, ind) {\
     bx = splat_load(b, ind); \
@@ -225,7 +226,10 @@ static inline void mul_u52_karatsuba(pvec r, cpvec a, cpvec b, uint64_t an, uint
     add_nc_52(point_inf, point_0 + split_len, point_inf, split_len*8);
     add_nc_52(point_0 + split_len, point_inf, point_0, split_len*8);
     add_nc_52(point_inf, point_inf, point_inf+split_len, an + bn - split_len * 8);
-    if(flag) add_nc_52(point_0 + split_len, point_0 + split_len, point_n1,sa_len + sb_len);
-    else sub_nc_52(point_0 + split_len, point_0 + split_len, point_n1, sa_len + sb_len);
-    // canonize
+    // Directive: Rewrite the last add/sub into sequential canonize -> add/sub with canon -> canonize
+    if(flag){
+        add_nc_52(point_0 + split_len, point_0 + split_len, point_n1,sa_len + sb_len);
+    }else{
+        sub_nc_52(point_0 + split_len, point_0 + split_len, point_n1, sa_len + sb_len);
+    }
 }

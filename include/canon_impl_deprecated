@@ -1,3 +1,4 @@
+// deprecated.
 inline static void _MPN_CANON(pvec a, uint64_t n) {
   _vec carry_vec = zero();
   _vec a0, a1, a2, a3;

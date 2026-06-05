@@ -11,12 +11,17 @@ typedef uint64_t *plimb;
 typedef uint32_t *phlimb;
 
 #define EVAL(x) x
+#define EMPTY
 
 #define CAT_(x, y) x##y
 #define CAT(x, y) CAT_(x, y)
 
 #define CAT3_(x, y, z) x##y##z
 #define CAT3(x, y, z) CAT3_(x, y, z)
+
+#define de_args(...)       __VA_ARGS__
+#define list_cat_0(a, ...) (de_args a __VA_OPT__(,) __VA_ARGS__)
+#define list_cat(a, b)     list_cat_0(a, de_args b)
 
 #define NARGS_(_1, _2, _3, _4, _5, _6, N, ...) N
 #define NARGS(...) NARGS_(__VA_ARGS__, 6, 5, 4, 3, 2, 1)
