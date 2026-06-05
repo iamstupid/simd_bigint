@@ -26,7 +26,7 @@ CAT(mpn_canon_pos, suf)(pvec r, cpvec a, uint64_t n, ##__VA_ARGS__){ \
 }
 
 static inline void canon_pos(EMPTY,_vec _c = zero(); , EMPTY)
-static inline _vec canon_pos(_c,EMPTY,return _c;,_vec _c)
+static inline _vec canon_pos(_c,EMPTY,return add(_c, set1_64(sig));,_vec _c)
 static inline _vec mpn_u52_add_canon(pvec r, cpvec a, cpvec b, uint64_t n, _vec _c){
     int sig = 0;
     for(n=(n+7)>>3;n;--n){
@@ -34,7 +34,7 @@ static inline _vec mpn_u52_add_canon(pvec r, cpvec a, cpvec b, uint64_t n, _vec 
         canonize(t, _c, sig);
         store_vec(r++, t);
     }
-    return _c;
+    return add(_c, set1_64(sig));
 }
 
 #define canonneg_init(carry) \

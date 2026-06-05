@@ -1,5 +1,8 @@
 #include "../include/mul.h"
 
+#ifdef __cplusplus
+extern "C"
+#endif
 void
 bench_mul_u52_basecase_old(unsigned long long *rp,
                            const unsigned long long *ap,
