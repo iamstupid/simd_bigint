@@ -1,17 +1,33 @@
 #pragma once
 #include "types.h"
+
+#define carry_prop_t(add, sub, prp, r, a, b, carry, ...) { \
+    _vec res = add(a, b); \
+    __mmask16 _prop = eq(res, prp); \
+    __mmask16 _carr = gtu(res, MASK52); \
+    carry |= _carr << 1; \
+    carry += _prop; \
+    _prop ^= carry; \
+    carry >>=8; \
+    res = and_v(sub(res, MASK52, _prop, res), MASK52); \
+    store_vec(r++, res, ##__VA_ARGS__); \
+}
+
+#define carry_prop(r, a, b, carry, ...) carry_prop_t(add, sub, MASK52, r, a, b, carry, ##__VA_ARGS__)
+#define borrow_prop(r, a, b, carry, ...) carry_prop_t(sub, add, zero(), r, a, b, carry, ##__VA_ARGS__)
+
 #define canonize(vec, carry, sigcarry) do {                         \
-    static const _vec MASK52 = set1_64((1ull<<52)-1) ;\
+    static const _vec M = MASK52;\
     _vec hi  = srli(vec, 52);                /* full per-lane overflow */ \
     _vec his = alignr64(hi, carry, 7);       /* hi[i-1]; lane0 <- carry[7] */ \
-    _vec _canon_t = add(and_v(vec, MASK52), his); /* low + carry-in, < 2^53 */ \
+    _vec _canon_t = add(and_v(vec, M), his); /* low + carry-in, < 2^53 */ \
     carry    = hi;                                                  \
-    unsigned g = (unsigned)gtu(_canon_t, MASK52); /* generate : t >  MASK */ \
-    unsigned p = (unsigned)eq (_canon_t, MASK52); /* propagate: t == MASK */ \
+    unsigned g = (unsigned)gtu(_canon_t, M); /* generate : t >  MASK */ \
+    unsigned p = (unsigned)eq (_canon_t, M); /* propagate: t == MASK */ \
     unsigned chain = p + ((g << 1) | sigcarry);  /* SWAR carry ripple   */  \
     sigcarry = chain >> 8;                   /* carry out of lane 7  */     \
     __mmask8 cin = (__mmask8)(p ^ chain);    /* lanes that received a carry */ \
-    vec = and_v(sub(_canon_t, MASK52, cin, _canon_t), MASK52);         \
+    vec = and_v(sub(_canon_t, M, cin, _canon_t), M);         \
 } while(0)
 
 #define canon_pos(suf, pre, ret, ...) \
@@ -38,7 +54,7 @@ static inline _vec mpn_u52_add_canon(pvec r, cpvec a, cpvec b, uint64_t n, _vec 
 }
 
 #define canonneg_init(carry) \
-    const _vec M = set1_64((1ll<<52)-1); \
+    const _vec M = MASK52; \
     const _vec Z = zero(); \
     _vec bw_v = slli(srli((carry), 63), 12); \
     _vec hi_v = and_v(set1_64(0xFFF), (carry)); \
@@ -97,37 +113,3 @@ static inline _vec mpn_u52_sub_canon(pvec r, cpvec a, cpvec b, uint64_t n, _vec 
 #undef canonneg_done
 #undef canonneg
 #undef canon_neg
-
-/**
-inline static _vec mpn_u52_sub_canon_simd(pvec r, cpvec a, cpvec b, uint64_t n, _vec carry){
-    const _vec M   = set1_64((1ll<<52)-1);
-    const _vec Z   = zero();
-    _vec bw_v = slli(srli(carry, 63), 12), hi_v = and_v(set1_64(0xFFF), carry);          // cross-vector: bias-borrow and carry (lane 7 -> next lane 0)
-    int  bin  = 0, cin  = 0;          // cross-vector: unit-borrow and unit-carry prefix nets
-    for(n = (n+7)>>3; n; --n){
-        _vec u  = sub(load_vec(a++), load_vec(b++));   // signed, in band
-        _vec lo = and_v(u, M);                         // [0, 2^52)
-        _vec hi = srli(u, 52);                         // [0, 2^12)  non-negative carry  (u>>>52)
-        _vec bw = slli(srli(u, 63), 12);               // {0, 2^12}  borrow owed to next limb
-
-        // ---- borrow-only prefix: w = lo - bw[i-1], ripple unit borrows ----
-        _vec w   = sub(lo, alignr64(bw, bw_v, 7));  bw_v = bw;   // [-2^12, 2^52)
-        unsigned gb = gtu(w, M);                       // w < 0   (generate: lo < bias borrow)
-        unsigned pb = eq (w, Z);                       // w == 0  (propagate unit borrow)
-        unsigned bc = pb + ((gb<<1) | (unsigned)bin);
-        bin = (int)(bc >> 8);
-        _vec rr = and_v(add(w, M, (__mmask8)(pb^bc), w), M);  // [0, 2^52)
-
-        // ---- carry-only prefix: t = rr + hi[i-1], ripple unit carries ----
-        _vec t   = add(rr, alignr64(hi, hi_v, 7));  hi_v = hi;   // [0, 2^52+2^12)
-        unsigned gc = gtu(t, M);                       // t >= 2^52  (generate)
-        unsigned pc = eq (t, M);                       // t == MASK  (propagate)
-        unsigned cc = pc + ((gc<<1) | (unsigned)cin);
-        cin = (int)(cc >> 8);
-        _vec res = and_v(sub(t, M, (__mmask8)(pc^cc), t), M);   // +1 via -MASK
-
-        store_vec(r++, res);
-    }
-    return add(sub(hi_v, bw_v), sub(set1_64(cin), set1_64(bin)));
-}
-*/

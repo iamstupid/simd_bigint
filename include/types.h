@@ -10,6 +10,8 @@ typedef uint32_t _hlimb;
 typedef uint64_t *plimb;
 typedef uint32_t *phlimb;
 
+#define SWAP(T,x,y) { T _s=(x); (x)=(y); (y)=_s; }
+
 #define EVAL(x) x
 #define EMPTY
 
@@ -272,3 +274,7 @@ typedef const vec_itype* cpvec;
 
 #define sbb(carry, a, b, r)                                                    \
   _subborrow_u64((carry), (a), (b), (unsigned long long *)(r))
+
+
+// masks that we need
+#define MASK52 set1_64((1ull<<52)-1)

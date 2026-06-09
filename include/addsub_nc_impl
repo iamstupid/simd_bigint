@@ -3,6 +3,7 @@ inline static void _MPN_ADDSUB_N(pvec r, cpvec a, cpvec b, uint64_t n) {
   _vec r0, a0, b0;
   uint64_t cnt = n >> 3;
   const uint64_t tail = n & 7;
+  const __mmask8 m = u52_limb_mask(tail);
 #pragma GCC unroll 4
   for(; cnt; --cnt){
     a0 = load_vec(a++);
@@ -11,9 +12,8 @@ inline static void _MPN_ADDSUB_N(pvec r, cpvec a, cpvec b, uint64_t n) {
     store_vec(r++, r0);
   }
   if(tail){
-    const __mmask8 m = u52_limb_mask(tail);
-    a0 = load_vec(a);
-    b0 = load_vec(b);
+    a0 = load_vec(a,m);
+    b0 = load_vec(b,m);
     flex_add(r0, a0, b0);
     store_vec(r, r0, m);
   }

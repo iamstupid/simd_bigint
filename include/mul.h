@@ -4,21 +4,17 @@
 #include "assert.h"
 #include "scratch.h"
 #include "canon.h"
+#include "interp_helpers.h"
 
-static inline __mmask8 u52_limb_mask(uint64_t n) {
-    const uint64_t r = n & 7;
-    return r ? (__mmask8)((1u << r) - 1u) : (__mmask8)0xff;
-}
-
-static inline uint64_t u52_vec_count(uint64_t n) {
+inline uint64_t u52_vec_count(uint64_t n) {
     return (n + 7) >> 3;
 }
 
-static inline pvec u52_pvec_add(pvec p, uint64_t limbs) {
+inline pvec u52_pvec_add(pvec p, uint64_t limbs) {
     return (pvec)((uint64_t *)(void *)p + limbs);
 }
 
-static inline cpvec u52_cpvec_add(cpvec p, uint64_t limbs) {
+inline cpvec u52_cpvec_add(cpvec p, uint64_t limbs) {
     return (cpvec)((const uint64_t *)(const void *)p + limbs);
 }
 
@@ -307,140 +303,8 @@ inline static void mul_u52_basecase(pvec r, cpvec a, cpvec b, uint64_t an, uint6
     }
 }
 
-static inline int64_t u52_cmp_and_sub(pvec r, cpvec a, cpvec b, uint64_t na, uint64_t nb) {
-    assert(na > 0);
-    assert(nb > 0);
-    const _vec mask52 = set1_64((1ull << 52) - 1);
-
-    #define U52_RESOLVE_FULL(vr_in, br_in) do {                \
-        _vec _vr = (vr_in);                                    \
-        __mmask16 _z = eq(_vr, zero());                        \
-        __mmask16 _c = lbr | ((__mmask16)(br_in) << 1);        \
-        _c += _z;                                              \
-        _z ^= _c;                                              \
-        lbr = _c >> 8;                                         \
-        _vr = and_v(add(_vr, mask52, _z, _vr), mask52);        \
-        store_vec(r++, _vr);                                   \
-    } while(0)
-    #define U52_RESOLVE_MSK(vr_in, br_in, mask) do {           \
-        _vec _vr = (vr_in);                                    \
-        __mmask16 _z = eq(_vr, zero());                        \
-        __mmask16 _c = lbr | ((__mmask16)(br_in) << 1);        \
-        _c += _z;                                              \
-        _z ^= _c;                                              \
-        lbr = _c >> 8;                                         \
-        _vr = and_v(add(_vr, mask52, _z, _vr), mask52);        \
-        store_vec(r++, _vr, mask);                             \
-    } while(0)
-
-    uint8_t sig = 0;
-
-    if(na < nb){
-        cpvec t = a; a = b; b = t;
-        uint64_t nt = na; na = nb; nb = nt;
-        sig = 1;
-    }
-    if(!na){
-        return 0;
-    }
-    uint8_t at = --na & 7, bt = --nb & 7;
-    __mmask8 am = (1<<(at+1)) - 1, bm = (1<<(bt+1)) - 1;
-    _vec ax, bx;
-    na >>= 3, nb >>= 3;
-    cpvec ap = a + na, bp = b + nb;
-
-    for(ax = load_vec(ap, am); na > nb; --na, ax = load_vec(--ap)){
-        if(neq(ax, zero())) goto compared;
-        at = 7;
-    }
-
-    for(bx = load_vec(bp, bm); ~na; --na, --nb){
-        const uint8_t neq_r = (uint8_t)neq(ax, bx);
-        if(neq_r){
-            const uint8_t lt_r = (uint8_t)ltu(ax, bx);
-            const uint8_t gt_r = neq_r ^ lt_r;
-            if(lt_r > gt_r){
-                cpvec t = a; a = b; b = t;
-                uint64_t nt = na; na = nb; nb = nt;
-                uint8_t mt = at; at = bt; bt = mt;
-                sig ^= 1;
-            }
-            goto compared;
-        }
-        if(!na) break;
-        ax = load_vec(--ap);
-        bx = load_vec(--bp);
-        at = bt = 7;
-    }
-    return 0;
-compared:
-    {
-        am = (1<<(at+1)) - 1, bm = (1<<(bt+1)) - 1;
-        uint64_t i;
-        uint8_t lbr = 0;
-        for(i = 0; i < nb; ++i){
-            ax = load_vec(a++), bx = load_vec(b++);
-            _vec rx = sub(ax, bx);
-            unsigned br = gtu(rx, mask52);
-            U52_RESOLVE_FULL(rx, br);
-        }
-        if(na == nb){
-            ax = load_vec(a, am), bx = load_vec(b, bm);
-            _vec rx = sub(ax, bx);
-            unsigned br = gtu(rx, mask52);
-            U52_RESOLVE_MSK(rx, br, am);
-        }else{
-            ax = load_vec(a++), bx = load_vec(b, bm);
-            _vec rx = sub(ax, bx);
-            unsigned br = gtu(rx, mask52);
-            U52_RESOLVE_FULL(rx, br);
-            for(++i;i<na;++i){
-                ax = load_vec(a++);
-                U52_RESOLVE_FULL(ax, 0);
-            }
-            ax = load_vec(a, am);
-            U52_RESOLVE_MSK(ax, 0, am);
-        }
-        #undef U52_RESOLVE_MSK
-        #undef U52_RESOLVE_FULL
-        return sig ? -(int64_t)(na*8+at+1) : (int64_t)(na*8+at+1);
-    }
-}
-
 static void mul_u52_dispatch(pvec r, cpvec a, cpvec b, uint64_t an, uint64_t bn, scratch *s);
 // contract: caller guarantees a is larger
-
-#define flex_add(r, a, b) r = add((a), (b))
-#define _MPN_ADDSUB_N add_nc_52
-#include "addsub_nc_impl"
-#undef flex_add
-#undef _MPN_ADDSUB_N
-
-#define flex_add(r, a, b) r = sub((a), (b))
-#define _MPN_ADDSUB_N sub_nc_52
-#include "addsub_nc_impl"
-#undef flex_add
-#undef _MPN_ADDSUB_N
-
-static inline void add_nc_52_tail_safe(pvec r, cpvec a, cpvec b, uint64_t n) {
-    _vec r0, a0, b0;
-    uint64_t cnt = n >> 3;
-    const uint64_t tail = n & 7;
-#pragma GCC unroll 4
-    for(; cnt; --cnt){
-        a0 = load_vec(a++);
-        b0 = load_vec(b++);
-        r0 = add(a0, b0);
-        store_vec(r++, r0);
-    }
-    if(tail){
-        const __mmask8 m = u52_limb_mask(tail);
-        a0 = load_vec(a, m);
-        b0 = load_vec(b, m);
-        r0 = add(a0, b0);
-        store_vec(r, r0, m);
-    }
-}
 
 static inline void mul_u52_karatsuba(pvec r, cpvec a, cpvec b, uint64_t an, uint64_t bn, scratch *s) {
     assert(an >= bn); // contract: caller guarantees a is larger
@@ -485,7 +349,7 @@ static inline void mul_u52_karatsuba(pvec r, cpvec a, cpvec b, uint64_t an, uint
     add_nc_52(point_mid, point_inf, point_0, split_limbs);
     const uint64_t vinf_len = a1_len + b1_len;
     if(vinf_len > split_limbs){
-        add_nc_52_tail_safe(point_inf, point_inf, u52_pvec_add(point_inf, split_limbs), vinf_len - split_limbs);
+        add_nc_52(point_inf, point_inf, u52_pvec_add(point_inf, split_limbs), vinf_len - split_limbs);
     }
     if(n1_len){
         if(flag){
