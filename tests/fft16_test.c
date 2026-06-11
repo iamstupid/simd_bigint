@@ -45,11 +45,20 @@ static int roundtrip_pfa(uint32_t branch, uint32_t M){
 
     f16_pfa_fwd(pl->da, pl->pada, branch, M, pl);
     for(size_t i = 0; i < 2u * (size_t)nfull; ++i) pl->da[i] *= 1.0 / (double)nfull;
-    const double* tw = pl->tw22[__builtin_ctz(branch)];
-    for(uint32_t b = 0; b < M; ++b){
-        double* d = pl->da + 2u * (size_t)branch * b;
-        f16_inv_leaves_r8(d, branch, pl);
-        f16_mem_ir22(d, branch, tw);
+    if(F16_PFA3X2 && M == 3u){
+        /* 3x2 pipeline: branch-halves are independent n/2 transforms; the
+         * top r2 inverse lives in the fused emit */
+        for(uint32_t h = 0; h < 6; ++h)
+            { double* d = pl->da + (size_t)branch * h;
+              f16_ileaf_run(d, branch / 2u, f16_shape_of_full(branch / 2u).leaf, pl);
+              f16_inv_r8_only_full(d, branch / 2u, pl); }
+    }else{
+        const double* tw = pl->tw22[__builtin_ctz(branch)];
+        for(uint32_t b = 0; b < M; ++b){
+            double* d = pl->da + 2u * (size_t)branch * b;
+            f16_inv_leaves_r8(d, branch, pl);
+            f16_mem_ir22(d, branch, tw);
+        }
     }
     if(!f16_pfa_emit(pl->padr, pl->da, branch, M, pl)){
         printf("FAIL rt-pfa M=%u br=%u: carry out\n", M, branch);

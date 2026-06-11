@@ -207,6 +207,19 @@ static inline f16_shape f16_shape_of(uint32_t n){
     return s;
 }
 
+/* full-length stage shape: for a transform whose FIRST stage is an r8
+ * pass at len m (no prior fused levels). Used by the 3x2 branch-halves. */
+static inline f16_shape f16_shape_of_full(uint32_t m){
+    unsigned lgm = (unsigned)__builtin_ctz(m);
+    f16_shape s;
+    uint32_t leaf_lg = 5u + ((lgm - 5u) % 3u);
+    s.leaf = 1u << leaf_lg;
+    s.cnt  = (lgm - leaf_lg) / 3u;
+    uint32_t len = m;
+    for(uint32_t i = 0; i < s.cnt; ++i, len /= 8u) s.len[i] = len;
+    return s;
+}
+
 /* Twiddle tables are shared across transform sizes and grown once:
  *  - tw22[lg]: len-2^lg r22 unroll-2 table (input + final-emit stage of a
  *    size-2^lg transform), 2^lg doubles. Depends on len only.
@@ -226,6 +239,8 @@ typedef struct {
     _Alignas(64) double l64w[4 * 16];   /* w1, w1*w8, w2, w4 at len 64 */
     _Alignas(64) double l128w[8 * 16];  /* {W1,W2} at len 128, t = 0..3 */
     _Alignas(64) double gh0[16];        /* head g-values: g(p>>2), p = 0..7 */
+    _Alignas(64) double wt5[5 * 16];    /* PFA lane fixup w_5^{b*(l%5)} */
+    _Alignas(64) double wt7[7 * 16];    /* PFA lane fixup w_7^{b*(l%7)} */
     __m512i  dec_idx[4];        /* u16 digit decode shuffles   */
     int      leaf_init;
     /* workspace */
@@ -295,6 +310,17 @@ static inline void f16_leaf_init(f16_plan* pl){
         f16_twcv(pl->l128w + 32 * t,      (uint64_t)(8 * t), 1, 128);
         f16_twcv(pl->l128w + 32 * t + 16, (uint64_t)(8 * t), 2, 128);
     }
+    /* PFA lane-twiddle fixups: wtM[b] lane l = e^{-2pi i b (l%M) / M} */
+    for(int b = 0; b < 5; ++b)
+        for(int l = 0; l < 8; ++l){
+            double th = -2.0 * F16_PI * (double)(b * (l % 5)) / 5.0;
+            pl->wt5[16 * b + l] = cos(th); pl->wt5[16 * b + 8 + l] = sin(th);
+        }
+    for(int b = 0; b < 7; ++b)
+        for(int l = 0; l < 8; ++l){
+            double th = -2.0 * F16_PI * (double)(b * (l % 7)) / 7.0;
+            pl->wt7[16 * b + l] = cos(th); pl->wt7[16 * b + 8 + l] = sin(th);
+        }
     /* digit decode: parity x tile -> 8 dword slots of (2-byte digit, 2 zero) */
     for(int v = 0; v < 4; ++v){
         int parity = v & 1, tile = v >> 1;
@@ -382,6 +408,11 @@ static inline void f16_plan_ensure(f16_plan* pl, uint32_t branch, uint32_t nfull
     f16_shape sh = f16_shape_of(branch);
     for(uint32_t s = 0; s < sh.cnt; ++s)
         f16_build_tw8(pl, (unsigned)__builtin_ctz(sh.len[s]));
+    if(branch >= 256u){     /* 3x2 branch-halves use full-length stage plans */
+        f16_shape shh = f16_shape_of_full(branch / 2u);
+        for(uint32_t s = 0; s < shh.cnt; ++s)
+            f16_build_tw8(pl, (unsigned)__builtin_ctz(shh.len[s]));
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -641,35 +672,6 @@ static inline void f16_pfa_input_impl(double* data, const uint64_t* src,
         r[b] = (uint32_t)(((uint64_t)b * n) % M);
     }
     const __m512i* IDX = pl->dec_idx;
-    if(M >= 7u){
-        /* single-tile grain: 2 decoded tiles per stripe would hold 28 zmm
-         * before the butterfly and spill half the register file */
-        for(uint32_t i = 0; i < n / 8u; ++i){
-            fcv t[7], x[7], y[7];
-            for(uint32_t b = 0; b < M; ++b){
-                __m512i raw = _mm512_castsi256_si512(
-                    _mm256_loadu_si256((const __m256i*)s[b]));
-                t[b].re = f16_dec1(raw, IDX[0]);
-                t[b].im = f16_dec1(raw, IDX[1]);
-                s[b] += 4;
-            }
-            for(uint32_t a = 0; a < M; ++a){
-                x[a] = t[0];
-                for(uint32_t b = 0; b < M; ++b){
-                    uint32_t d = (a + M - r[b]) % M;
-                    x[a].re = _mm512_mask_mov_pd(x[a].re, km[d], t[b].re);
-                    x[a].im = _mm512_mask_mov_pd(x[a].im, km[d], t[b].im);
-                }
-            }
-            f16_pfa_bfly(x, y, M, 0);
-            for(uint32_t b = 0; b < M; ++b){
-                f_store(p[b], y[b]);
-                p[b] += 16;
-                r[b] = (r[b] + 8u) % M;
-            }
-        }
-        return;
-    }
     for(uint32_t i = 0; i < n / 16u; ++i){
         fcv t0[7], t1[7];
         for(uint32_t b = 0; b < M; ++b){
@@ -698,14 +700,147 @@ static inline void f16_pfa_input_impl(double* data, const uint64_t* src,
         }
     }
 }
+/* twiddle-fixup form for M >= 5 (measured: bench/pfa_io_bench). The M-DFT
+ * runs directly on residue-relabeled stripe vectors,
+ *   y[b](l) = sum_s w^{b r_s} w^{b l} t_s(l),
+ * so the M^2 lane merges collapse to M constant per-lane cmuls. At M = 3
+ * the merge form above is cheaper than the extra cmuls. */
+__attribute__((always_inline))
+static inline void f16_pfa_input_tw(double* data, const uint64_t* src,
+                                    uint32_t n, uint32_t M, const double* wt,
+                                    const f16_plan* pl){
+    /* stripe POINTERS are held in residue order (sp[rho] = stripe whose
+     * lane-0 residue is currently rho) and rotated by the constant
+     * 16 mod M each iteration, so every vector-slot index is compile-time
+     * constant and t[]/x[]/y[] fully enregister; the runtime relabel is
+     * GPR pointer renaming only. Sub-tile 1 relabels by the constant
+     * shift 8 mod M. */
+    const uint64_t* sp[7]; double* p[7];
+    for(uint32_t b = 0; b < M; ++b){
+        uint32_t rho = (uint32_t)(((uint64_t)b * n) % M);
+        sp[rho] = src + (size_t)b * (n / 2u);
+        p[b] = data + 2u * (size_t)n * b;
+    }
+    const __m512i* IDX = pl->dec_idx;
+    const uint32_t sh8 = 8u % M, sh16 = 16u % M;
+    for(uint32_t i = 0; i < n / 16u; ++i){
+        fcv t0[7], t1[7], x[7], y[7];
+        for(uint32_t rho = 0; rho < M; ++rho){
+            f16_dec2(&t0[rho], &t1[rho], sp[rho], IDX);
+            sp[rho] += 8;
+        }
+        f16_pfa_bfly(t0, y, M, 0);
+        for(uint32_t b = 0; b < M; ++b){
+            fcv w; w.re = _mm512_load_pd(wt + 16u * b);
+                   w.im = _mm512_load_pd(wt + 16u * b + 8u);
+            f_store(p[b], f_mul(y[b], w));
+        }
+        for(uint32_t rho = 0; rho < M; ++rho)
+            x[(rho + sh8) % M] = t1[rho];
+        f16_pfa_bfly(x, y, M, 0);
+        for(uint32_t b = 0; b < M; ++b){
+            fcv w; w.re = _mm512_load_pd(wt + 16u * b);
+                   w.im = _mm512_load_pd(wt + 16u * b + 8u);
+            f_store(p[b] + 16, f_mul(y[b], w));
+            p[b] += 32;
+        }
+        const uint64_t* tmp[7];
+        for(uint32_t rho = 0; rho < M; ++rho) tmp[(rho + sh16) % M] = sp[rho];
+        for(uint32_t rho = 0; rho < M; ++rho) sp[rho] = tmp[rho];
+    }
+}
+/* A/B'd end-to-end vs the plain radix-3 + mem_r22 pipeline: 3x2 LOSES
+ * 6-9% (192 limbs: 8.4 vs 9.1 ns/limb; 3072: 9.8 vs 10.7). The deleted
+ * mem_r22/mem_ir22 sweeps (~3.5%) are outweighed by the heavier 6-stream
+ * I/O kernels and the leaf-flavor rotation (branch-256 halves land on
+ * leaf128). Kept switchable; revisit if leaf128 or the rad3 get cheaper. */
+#ifndef F16_PFA3X2
+#define F16_PFA3X2 0
+#endif
+
+/* radix-3x2 input for M = 3: fuses the branch transform's top r2 level
+ * (twiddle w_n^{k1} from the tw22 w1 entries) into the radix-3 input pass.
+ * 6 read streams (3 stripes x 2 half-offsets), 6 write streams (e/o half
+ * per branch). Each branch-half is then an independent n/2 transform that
+ * starts directly at the r8 cascade -- no separate mem_r22 sweep. */
+static inline void f16_pfa3x2_input(double* data, const uint64_t* src,
+                                    uint32_t n, const f16_plan* pl){
+    uint8_t km[8]; f16_kmasks(km, 3u);
+    const uint64_t* sj[3]; const uint64_t* sk[3];
+    double* pe[3]; double* po[3];
+    uint32_t rj[3], rk[3];
+    for(uint32_t b = 0; b < 3; ++b){
+        sj[b] = src + (size_t)b * (n / 2u);
+        sk[b] = sj[b] + n / 4u;
+        pe[b] = data + 2u * (size_t)n * b;
+        po[b] = pe[b] + n;
+        rj[b] = (uint32_t)(((uint64_t)b * n) % 3u);
+        rk[b] = (uint32_t)(((uint64_t)b * n + n / 2u) % 3u);
+    }
+    const __m512i* IDX = pl->dec_idx;
+    /* the tw22 w1 entries span j in [0, n/4); the second quarter's twiddle
+     * is w_n^{j} = i * w_n^{j - n/4} (e^{+} convention), so phase 2 rewinds
+     * the table and applies f_j. */
+    const double* tw = pl->tw22[__builtin_ctz(n)];
+    for(uint32_t i = 0; i < n / 32u; ++i){
+        if(i == n / 64u) tw = pl->tw22[__builtin_ctz(n)];
+        const int ph2 = i >= n / 64u;
+        for(int sub = 0; sub < 2; ++sub){
+            fcv tj[3], tk[3];
+            for(uint32_t b = 0; b < 3; ++b){
+                __m512i raw = _mm512_castsi256_si512(
+                    _mm256_loadu_si256((const __m256i*)sj[b]));
+                tj[b].re = f16_dec1(raw, IDX[0]);
+                tj[b].im = f16_dec1(raw, IDX[1]);
+                sj[b] += 4;
+                raw = _mm512_castsi256_si512(
+                    _mm256_loadu_si256((const __m256i*)sk[b]));
+                tk[b].re = f16_dec1(raw, IDX[0]);
+                tk[b].im = f16_dec1(raw, IDX[1]);
+                sk[b] += 4;
+            }
+            fcv xj[3], xk[3], yj[3], yk[3];
+            for(uint32_t a = 0; a < 3; ++a){
+                xj[a] = tj[0]; xk[a] = tk[0];
+                for(uint32_t b = 0; b < 3; ++b){
+                    uint32_t dj = (a + 3u - rj[b]) % 3u;
+                    uint32_t dk = (a + 3u - rk[b]) % 3u;
+                    xj[a].re = _mm512_mask_mov_pd(xj[a].re, km[dj], tj[b].re);
+                    xj[a].im = _mm512_mask_mov_pd(xj[a].im, km[dj], tj[b].im);
+                    xk[a].re = _mm512_mask_mov_pd(xk[a].re, km[dk], tk[b].re);
+                    xk[a].im = _mm512_mask_mov_pd(xk[a].im, km[dk], tk[b].im);
+                }
+            }
+            f16_pfa_bfly(xj, yj, 3u, 0);
+            f16_pfa_bfly(xk, yk, 3u, 0);
+            fcv w; w.re = _mm512_load_pd(tw + 32 * sub);
+                   w.im = _mm512_load_pd(tw + 32 * sub + 8);
+            if(ph2) w = f_j(w);
+            for(uint32_t b = 0; b < 3; ++b){
+                f_store(pe[b], f_add(yj[b], yk[b]));
+                f_store(po[b], f_mul(f_sub(yj[b], yk[b]), w));
+                pe[b] += 16; po[b] += 16;
+                rj[b] = (rj[b] + 8u) % 3u;
+                rk[b] = (rk[b] + 8u) % 3u;
+            }
+        }
+        tw += 64;
+    }
+}
+
 /* literal-M dispatcher: lets the compiler specialize the impl per M so the
  * x[]/y[] arrays enregister and the residue arithmetic strength-reduces */
 static inline void f16_pfa_input(double* data, const uint64_t* src,
                                  uint32_t n, uint32_t M, const f16_plan* pl){
     switch(M){
-    case 3:  f16_pfa_input_impl(data, src, n, 3u, pl); break;
-    case 5:  f16_pfa_input_impl(data, src, n, 5u, pl); break;
-    default: f16_pfa_input_impl(data, src, n, 7u, pl); break;
+    /* end-to-end bisect (bench/pfa_io_bench + full-mul): the merge input
+     * wins in the full-mul context for M=3 (and gains the fused r2);
+     * rotated-tw wins for M=5/7. */
+    case 3:  if(F16_PFA3X2) f16_pfa3x2_input(data, src, n, pl);
+             else            f16_pfa_input_impl(data, src, n, 3u, pl);
+             break;
+    case 5:  f16_pfa_input_tw(data, src, n, 5u, pl->wt5, pl); break;
+    default: f16_pfa_input_tw(data, src, n, 7u, pl->wt7, pl); break;
     }
 }
 
@@ -1036,10 +1171,47 @@ static inline void f16_fwd(double* data, const uint64_t* src, uint32_t n,
     f16_input_stage(data, src, n, pl);
     f16_fwd_core(data, n, pl);
 }
-/* PFA forward: radix-M input stage, then a full pow2 transform per branch */
+/* full-length cores: first stage is an r8 pass at len m itself */
+static inline void f16_fwd_core_full(double* data, uint32_t m, const f16_plan* pl){
+    f16_shape sh = f16_shape_of_full(m);
+    uint32_t s = 0;
+    while(s < sh.cnt && sh.len[s] > F16_BLOCK){
+        f16_r8_stage(data, m, sh.len[s], pl->tw8[__builtin_ctz(sh.len[s])]);
+        s++;
+    }
+    uint32_t chunk = s < sh.cnt ? sh.len[s] : (sh.leaf == 128u ? 128u : 64u);
+    for(uint32_t base = 0; base < m; base += chunk){
+        double* d = data + 2u * (size_t)base;
+        for(uint32_t ss = s; ss < sh.cnt; ++ss)
+            f16_r8_stage(d, chunk, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
+        f16_leaf_run(d, chunk, sh.leaf, pl);
+    }
+}
+static inline void f16_inv_r8_only_full(double* data, uint32_t m, const f16_plan* pl){
+    f16_shape sh = f16_shape_of_full(m);
+    uint32_t s = 0;
+    while(s < sh.cnt && sh.len[s] > F16_BLOCK) s++;
+    uint32_t chunk = s < sh.cnt ? sh.len[s] : (sh.leaf == 128u ? 128u : 64u);
+    if(s < sh.cnt)
+        for(uint32_t base = 0; base < m; base += chunk){
+            double* d = data + 2u * (size_t)base;
+            for(uint32_t ss = sh.cnt; ss-- > s; )
+                f16_ir8_stage(d, chunk, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
+        }
+    for(uint32_t ss = s; ss-- > 0; )
+        f16_ir8_stage(data, m, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
+}
+/* PFA forward. M = 3: the 3x2 input already did the branch's top r2 level,
+ * so each branch-half is an independent n/2 transform starting at the r8
+ * cascade. M = 5, 7: radix-M input, then mem_r22 + core per branch. */
 static inline void f16_pfa_fwd(double* data, const uint64_t* src, uint32_t n,
                                uint32_t M, const f16_plan* pl){
     f16_pfa_input(data, src, n, M, pl);
+    if(F16_PFA3X2 && M == 3u){
+        for(uint32_t h = 0; h < 6; ++h)
+            f16_fwd_core_full(data + (size_t)n * h, n / 2u, pl);
+        return;
+    }
     const double* tw = pl->tw22[__builtin_ctz(n)];
     for(uint32_t b = 0; b < M; ++b){
         double* d = data + 2u * (size_t)n * b;
@@ -1265,23 +1437,23 @@ static inline void f16_ileaf_group(double* A, uint32_t g, uint32_t leaf,
  * pair structure is block-aligned (gl even, partner block descending), so
  * leaves run once per touched block. */
 static inline void f16_pointwise_mul_ileaves(double* A, double* B, uint32_t n,
-                                             double sc_d, const f16_plan* pl){
+                                             double sc_d, uint32_t leaf,
+                                             const f16_plan* pl){
     const __m512d sc = _mm512_set1_pd(sc_d), qsc = _mm512_set1_pd(0.25 * sc_d);
-    f16_shape sh = f16_shape_of(n);
 
     f16_pw_head(A, B, pl, sc, qsc);          /* group 0 */
     f16_pw_groups(A, B, 1, 1, pl, sc, qsc);  /* base 64: in-group mirror */
-    if(sh.leaf == 128u) f16_ileaf128_run(A, 128u, pl);
-    else { f16_ileaf_group(A, 0, sh.leaf, pl); f16_ileaf_group(A, 1, sh.leaf, pl); }
+    if(leaf == 128u) f16_ileaf128_run(A, 128u, pl);
+    else { f16_ileaf_group(A, 0, leaf, pl); f16_ileaf_group(A, 1, leaf, pl); }
 
     for(uint32_t base = 128; base < n; base <<= 1){
         uint32_t g0 = base / 64u;
         for(uint32_t gl = g0; gl < g0 + base / 128u; ++gl){
             uint32_t gr = 3u * g0 - 1u - gl;
             f16_pw_groups(A, B, gl, gr, pl, sc, qsc);
-            if(sh.leaf != 128u){
-                f16_ileaf_group(A, gl, sh.leaf, pl);
-                f16_ileaf_group(A, gr, sh.leaf, pl);
+            if(leaf != 128u){
+                f16_ileaf_group(A, gl, leaf, pl);
+                f16_ileaf_group(A, gr, leaf, pl);
             }else if(base == 128u){
                 /* gl, gr are the two halves of one 128-block (block-scale
                  * analog of the base-64 in-group mirror) */
@@ -1374,27 +1546,27 @@ static inline void f16_pointwise_cross_ileaves(double* L, double* R,
                                                double* oL, double* oR,
                                                uint32_t n, double sc_d,
                                                double w3r, double w3i,
+                                               uint32_t leaf,
                                                const f16_plan* pl){
     const __m512d sc = _mm512_set1_pd(sc_d), qsc = _mm512_set1_pd(0.25 * sc_d);
-    f16_shape sh = f16_shape_of(n);
 
     f16_pw_head_cross(L, R, oL, oR, pl, w3r, w3i, sc, qsc);     /* group 0  */
     f16_pw_groups_cross(L, R, oL, oR, 1, 1, pl, w3r, w3i, sc, qsc); /* base 64 */
-    if(sh.leaf == 128u){
+    if(leaf == 128u){
         f16_ileaf128_run(L, 128u, pl);
         f16_ileaf128_run(R, 128u, pl);
     }else{
-        f16_ileaf_group(L, 0, sh.leaf, pl); f16_ileaf_group(L, 1, sh.leaf, pl);
-        f16_ileaf_group(R, 0, sh.leaf, pl); f16_ileaf_group(R, 1, sh.leaf, pl);
+        f16_ileaf_group(L, 0, leaf, pl); f16_ileaf_group(L, 1, leaf, pl);
+        f16_ileaf_group(R, 0, leaf, pl); f16_ileaf_group(R, 1, leaf, pl);
     }
     for(uint32_t base = 128; base < n; base <<= 1){
         uint32_t g0 = base / 64u;
         for(uint32_t gl = g0; gl < 2u * g0; ++gl){       /* full range */
             uint32_t gr = 3u * g0 - 1u - gl;
             f16_pw_groups_cross(L, R, oL, oR, gl, gr, pl, w3r, w3i, sc, qsc);
-            if(sh.leaf != 128u){
-                f16_ileaf_group(L, gl, sh.leaf, pl);
-                f16_ileaf_group(R, gr, sh.leaf, pl);
+            if(leaf != 128u){
+                f16_ileaf_group(L, gl, leaf, pl);
+                f16_ileaf_group(R, gr, leaf, pl);
             }else if(gl & 1u){
                 f16_ileaf128_run(L + 256u * (size_t)((gl - 1u) >> 1), 128u, pl);
                 f16_ileaf128_run(R + 256u * (size_t)(gr >> 1), 128u, pl);
@@ -1527,8 +1699,8 @@ static inline int f16_pfa_emit_impl(uint64_t* rp, double* data, uint32_t n,
         ch[b].prev_hi = _mm512_setzero_si512();
         ch[b].cin = 0;
     }
-    /* M >= 5 cannot hold both sub-tiles of all fronts in registers; stage
-     * the shuffled butterfly outputs in an L1 buffer and pack from it. */
+    /* Both sub-tiles of all fronts cannot stay in registers; stage the
+     * shuffled butterfly outputs in an L1 buffer and pack from it. */
     _Alignas(64) double stage[7 * 2 * 16];
     for(uint32_t t = 0; t < n / 8u; t += 2){
         for(int u = 0; u < 2; ++u){
@@ -1575,12 +1747,249 @@ static inline int f16_pfa_emit_impl(uint64_t* rp, double* data, uint32_t n,
     }
     return 1;
 }
+/* twiddle-fixup emit for M >= 5: pre-rotate by conj(w^{b l}), inverse-DFT
+ * over relabeled branches; the region output is then a pure index relabel. */
+__attribute__((always_inline))
+static inline int f16_pfa_emit_tw(uint64_t* rp, double* data, uint32_t n,
+                                  uint32_t M, const double* wt,
+                                  const f16_plan* pl){
+    (void)pl;
+    const double* br[7]; uint64_t* r[7]; uint32_t phi[7];
+    f16_chain ch[7];
+    const size_t limbs_b = (size_t)n / 2u;
+    for(uint32_t b = 0; b < M; ++b){
+        br[b]  = data + 2u * (size_t)n * b;
+        r[b]   = rp + (size_t)b * limbs_b;
+        phi[b] = (uint32_t)(((uint64_t)b * n) % M);
+        ch[b].prev_hi = _mm512_setzero_si512();
+        ch[b].cin = 0;
+    }
+    /* region-slot map in phi order: rg[phi] = region whose front residue is
+     * currently phi; y[] stays constant-indexed and the runtime relabel
+     * moves into the scalar staging address. rg rotates by 16 mod M. */
+    uint32_t rg[7];
+    for(uint32_t b = 0; b < M; ++b)
+        rg[(uint32_t)(((uint64_t)b * n) % M)] = b;
+    const uint32_t sh8 = 8u % M, sh16 = 16u % M;
+    _Alignas(64) double stage[7 * 2 * 16];
+    for(uint32_t t = 0; t < n / 8u; t += 2){
+        for(int u = 0; u < 2; ++u){
+            fcv x[7], y[7];
+            for(uint32_t b = 0; b < M; ++b){
+                fcv w; w.re = _mm512_load_pd(wt + 16u * b);
+                       w.im = _mm512_load_pd(wt + 16u * b + 8u);
+                x[b] = f_mulc(f_load(br[b]), w);
+                br[b] += 16;
+            }
+            f16_pfa_bfly(x, y, M, 1);
+            /* y[j] belongs to the region whose phi (this sub-tile) == j */
+            for(uint32_t j = 0; j < M; ++j){
+                uint32_t slot = u ? rg[(j + M - sh8) % M] : rg[j];
+                f_store(stage + 32u * slot + 16u * (uint32_t)u, y[j]);
+            }
+        }
+        for(uint32_t b = 0; b < M; ++b){
+            f16_lohi q = f16_pack2(f_load(stage + 32u * b),
+                                   f_load(stage + 32u * b + 16u));
+            _mm512_storeu_si512((void*)r[b], f16_chain_step(&ch[b], q));
+            r[b] += 8;
+        }
+        uint32_t tmp[7];
+        for(uint32_t j = 0; j < M; ++j) tmp[(j + sh16) % M] = rg[j];
+        for(uint32_t j = 0; j < M; ++j) rg[j] = tmp[j];
+    }
+    for(uint32_t b = 0; b + 1u < M; ++b){
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[b].prev_hi + 56, 8);
+        unsigned __int128 c = (unsigned __int128)hi7 + ch[b].cin;
+        uint64_t* q = rp + (size_t)(b + 1u) * limbs_b;
+        uint64_t* qe = rp + (size_t)M * limbs_b;
+        while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
+        if(c) return 0;
+    }
+    {
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[M - 1u].prev_hi + 56, 8);
+        if(hi7 + ch[M - 1u].cin != 0) return 0;
+    }
+    return 1;
+}
+/* stage-free emit: both butterflies' outputs are held in registers and
+ * packed with constant indices (j, (j+8%M)%M); ALL per-region state --
+ * store pointer and carry chain -- lives in phi-rotating slots, so the
+ * per-step relabel is pure GPR/SSA renaming. Region b's chain finishes in
+ * slot ((b+1)*n) mod M (phi advances by n over the whole pass). */
+__attribute__((always_inline))
+static inline int f16_pfa_emit_rot(uint64_t* rp, double* data, uint32_t n,
+                                   uint32_t M, const double* wt,
+                                   const f16_plan* pl){
+    (void)pl;
+    const double* br[7]; uint64_t* rph[7];
+    f16_chain ch[7];
+    const size_t limbs_b = (size_t)n / 2u;
+    for(uint32_t b = 0; b < M; ++b){
+        br[b] = data + 2u * (size_t)n * b;
+        uint32_t ph = (uint32_t)(((uint64_t)b * n) % M);
+        rph[ph] = rp + (size_t)b * limbs_b;
+        ch[ph].prev_hi = _mm512_setzero_si512();
+        ch[ph].cin = 0;
+    }
+    const uint32_t sh8 = 8u % M, sh16 = 16u % M;
+    for(uint32_t t = 0; t < n / 8u; t += 2){
+        fcv y0[7], y1[7];
+        {
+            fcv x[7];
+            for(uint32_t b = 0; b < M; ++b){
+                fcv w; w.re = _mm512_load_pd(wt + 16u * b);
+                       w.im = _mm512_load_pd(wt + 16u * b + 8u);
+                x[b] = f_mulc(f_load(br[b]), w);
+            }
+            f16_pfa_bfly(x, y0, M, 1);
+        }
+        {
+            fcv x[7];
+            for(uint32_t b = 0; b < M; ++b){
+                fcv w; w.re = _mm512_load_pd(wt + 16u * b);
+                       w.im = _mm512_load_pd(wt + 16u * b + 8u);
+                x[b] = f_mulc(f_load(br[b] + 16), w);
+                br[b] += 32;
+            }
+            f16_pfa_bfly(x, y1, M, 1);
+        }
+        for(uint32_t j = 0; j < M; ++j){
+            f16_lohi q = f16_pack2(y0[j], y1[(j + sh8) % M]);
+            _mm512_storeu_si512((void*)rph[j], f16_chain_step(&ch[j], q));
+            rph[j] += 8;
+        }
+        uint64_t* tp[7]; f16_chain tc[7];
+        for(uint32_t j = 0; j < M; ++j){ tp[(j + sh16) % M] = rph[j]; tc[(j + sh16) % M] = ch[j]; }
+        for(uint32_t j = 0; j < M; ++j){ rph[j] = tp[j]; ch[j] = tc[j]; }
+    }
+    for(uint32_t b = 0; b + 1u < M; ++b){
+        uint32_t sl = (uint32_t)(((uint64_t)(b + 1u) * n) % M);
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[sl].prev_hi + 56, 8);
+        unsigned __int128 c = (unsigned __int128)hi7 + ch[sl].cin;
+        uint64_t* q = rp + (size_t)(b + 1u) * limbs_b;
+        uint64_t* qe = rp + (size_t)M * limbs_b;
+        while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
+        if(c) return 0;
+    }
+    {
+        uint32_t sl = (uint32_t)(((uint64_t)M * n) % M);   /* == 0 */
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[sl].prev_hi + 56, 8);
+        if(hi7 + ch[sl].cin != 0) return 0;
+    }
+    return 1;
+}
+
+/* A/B'd end-to-end: the staged emit ties M=5 and wins M=7 -- holding both
+ * butterflies' y[] (28 zmm at M=7) spills more than the L1 staging costs,
+ * which hides under the butterfly FMAs. Keep rot for future re-evaluation
+ * (it wins if the butterfly's register footprint ever shrinks). */
+#ifndef F16_PFA_EMIT_ROT
+#define F16_PFA_EMIT_ROT 0
+#endif
+/* radix-3x2 emit: reads 6 streams (the e/o halves of each branch, both
+ * already inverse-transformed at n/2), applies the inverse top r2 (conj
+ * w1 twiddles) + inverse radix-3, and writes 6 natural fronts (low/high
+ * half of each region), one carry chain each. Mirrors f16_pfa3x2_input;
+ * the mem_ir22 sweep is gone. */
+static inline int f16_pfa3x2_emit(uint64_t* rp, double* data, uint32_t n,
+                                  const f16_plan* pl){
+    uint8_t km[8]; f16_kmasks(km, 3u);
+    const double* pe[3]; const double* po[3];
+    uint64_t* rf[6];
+    uint32_t fres[6];
+    f16_chain ch[6];
+    const size_t limbs_q = (size_t)n / 4u;       /* limbs per front */
+    for(uint32_t b = 0; b < 3; ++b){
+        pe[b] = data + 2u * (size_t)n * b;
+        po[b] = pe[b] + n;
+        rf[2 * b]     = rp + (size_t)b * (n / 2u);
+        rf[2 * b + 1] = rf[2 * b] + limbs_q;
+        fres[2 * b]     = (uint32_t)(((uint64_t)b * n) % 3u);
+        fres[2 * b + 1] = (uint32_t)(((uint64_t)b * n + n / 2u) % 3u);
+    }
+    for(int f = 0; f < 6; ++f){ ch[f].prev_hi = _mm512_setzero_si512(); ch[f].cin = 0; }
+    const double* tw = pl->tw22[__builtin_ctz(n)];
+    _Alignas(64) double stage[6 * 2 * 16];
+    for(uint32_t i = 0; i < n / 32u; ++i){
+        if(i == n / 64u) tw = pl->tw22[__builtin_ctz(n)];
+        const int ph2 = i >= n / 64u;
+        for(int sub = 0; sub < 2; ++sub){
+            fcv xlo[3], xhi[3], ylo[3], yhi[3];
+            fcv w; w.re = _mm512_load_pd(tw + 32 * sub);
+                   w.im = _mm512_load_pd(tw + 32 * sub + 8);
+            if(ph2) w = f_j(w);
+            for(uint32_t b = 0; b < 3; ++b){
+                fcv ee = f_load(pe[b]); pe[b] += 16;
+                fcv oo = f_load(po[b]); po[b] += 16;
+                fcv v = f_mulc(oo, w);
+                xlo[b] = f_add(ee, v);
+                xhi[b] = f_sub(ee, v);
+            }
+            f16_pfa_bfly(xlo, ylo, 3u, 1);
+            f16_pfa_bfly(xhi, yhi, 3u, 1);
+            for(uint32_t b = 0; b < 3; ++b){
+                uint32_t ph = (fres[2 * b] + (uint32_t)(8 * sub)) % 3u;
+                fcv o = ylo[0];
+                for(uint32_t j = 0; j < 3u; ++j){
+                    uint32_t d = (j + 3u - ph) % 3u;
+                    o.re = _mm512_mask_mov_pd(o.re, km[d], ylo[j].re);
+                    o.im = _mm512_mask_mov_pd(o.im, km[d], ylo[j].im);
+                }
+                f_store(stage + 32u * (2u * b) + 16u * (uint32_t)sub, o);
+                ph = (fres[2 * b + 1] + (uint32_t)(8 * sub)) % 3u;
+                o = yhi[0];
+                for(uint32_t j = 0; j < 3u; ++j){
+                    uint32_t d = (j + 3u - ph) % 3u;
+                    o.re = _mm512_mask_mov_pd(o.re, km[d], yhi[j].re);
+                    o.im = _mm512_mask_mov_pd(o.im, km[d], yhi[j].im);
+                }
+                f_store(stage + 32u * (2u * b + 1u) + 16u * (uint32_t)sub, o);
+            }
+        }
+        for(int f = 0; f < 6; ++f){
+            f16_lohi q = f16_pack2(f_load(stage + 32u * (uint32_t)f),
+                                   f_load(stage + 32u * (uint32_t)f + 16u));
+            _mm512_storeu_si512((void*)rf[f], f16_chain_step(&ch[f], q));
+            rf[f] += 8;
+            fres[f] = (fres[f] + 16u) % 3u;
+        }
+        tw += 64;
+    }
+    /* fronts are contiguous in rp order; junction f -> f+1, top must vanish */
+    for(int f = 0; f + 1 < 6; ++f){
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[f].prev_hi + 56, 8);
+        unsigned __int128 c = (unsigned __int128)hi7 + ch[f].cin;
+        uint64_t* q = rp + (size_t)(f + 1) * limbs_q;
+        uint64_t* qe = rp + 6u * limbs_q;
+        while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
+        if(c) return 0;
+    }
+    {
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[5].prev_hi + 56, 8);
+        if(hi7 + ch[5].cin != 0) return 0;
+    }
+    return 1;
+}
+
 static inline int f16_pfa_emit(uint64_t* rp, double* data, uint32_t n,
                                uint32_t M, const f16_plan* pl){
     switch(M){
-    case 3:  return f16_pfa_emit_impl(rp, data, n, 3u, pl);
-    case 5:  return f16_pfa_emit_impl(rp, data, n, 5u, pl);
-    default: return f16_pfa_emit_impl(rp, data, n, 7u, pl);
+    case 3:  return F16_PFA3X2 ? f16_pfa3x2_emit(rp, data, n, pl)
+                               : f16_pfa_emit_impl(rp, data, n, 3u, pl);
+#if F16_PFA_EMIT_ROT
+    case 5:  return f16_pfa_emit_rot(rp, data, n, 5u, pl->wt5, pl);
+    default: return f16_pfa_emit_rot(rp, data, n, 7u, pl->wt7, pl);
+#else
+    case 5:  return f16_pfa_emit_tw(rp, data, n, 5u, pl->wt5, pl);
+    default: return f16_pfa_emit_tw(rp, data, n, 7u, pl->wt7, pl);
+#endif
     }
 }
 
@@ -1592,11 +2001,11 @@ static _Thread_local f16_plan f16_tls;
 
 /* smallest supported transform >= need: pow2 N or M*2^L (M = 3: branch >=
  * 256; M = 5, 7: branch >= 128). Ties prefer the smaller M / pow2.
- * PFA-7 is gated off by default: measured slower than its pow2 fallback at
- * every branch size (the M^2 merge scaling + 18-mult butterfly eat the
- * 12.5% transform-size advantage). Lower the gate if that ever flips. */
+ * PFA-7 is enabled: with the pointer-rotation I/O (constant vector-slot
+ * indices, the residue relabel lives in GPR pointer renaming) it beats its
+ * pow2 fallback at every branch size. Raise the gate if that ever flips. */
 #ifndef F16_PFA7_MIN_BRANCH
-#define F16_PFA7_MIN_BRANCH (1u << 30)   /* disabled */
+#define F16_PFA7_MIN_BRANCH 128u
 #endif
 typedef struct { uint32_t nfull, branch, M; } f16_size;
 static inline f16_size f16_choose(uint32_t need){
@@ -1638,7 +2047,8 @@ static inline int fft16_mul(uint64_t* rp,
     if(M == 1){
         f16_fwd(pl->db, pl->padb, n, pl);
         f16_fwd(pl->da, pl->pada, n, pl);
-        f16_pointwise_mul_ileaves(pl->da, pl->db, n, 1.0 / (double)n, pl);
+        f16_pointwise_mul_ileaves(pl->da, pl->db, n, 1.0 / (double)n,
+                                  f16_shape_of(n).leaf, pl);
         f16_inv_r8_only(pl->da, n, pl);
         if(!f16_inv_final_emit(pl->padr, pl->da, n, pl)) return 0;
     }else{
@@ -1648,19 +2058,27 @@ static inline int fft16_mul(uint64_t* rp,
         const double* wrt = M == 3 ? F16_W3_RE : M == 5 ? F16_W5_RE : F16_W7_RE;
         const double* wit = M == 3 ? F16_W3_IM : M == 5 ? F16_W5_IM : F16_W7_IM;
         /* branch 0 self-pairs; branches (b, M-b) cross-pair with omega_M^b */
-        f16_pointwise_mul_ileaves(pl->da, pl->db, n, sc, pl);
+        uint32_t pwleaf = (F16_PFA3X2 && M == 3u)
+                            ? f16_shape_of_full(n / 2u).leaf
+                            : f16_shape_of(n).leaf;
+        f16_pointwise_mul_ileaves(pl->da, pl->db, n, sc, pwleaf, pl);
         for(uint32_t b = 1; b <= M / 2u; ++b){
             uint32_t bp2 = M - b;
             f16_pointwise_cross_ileaves(
                 pl->da + 2u * (size_t)n * b,   pl->da + 2u * (size_t)n * bp2,
                 pl->db + 2u * (size_t)n * b,   pl->db + 2u * (size_t)n * bp2,
-                n, sc, wrt[b], wit[b], pl);
+                n, sc, wrt[b], wit[b], pwleaf, pl);
         }
-        const double* tw = pl->tw22[__builtin_ctz(n)];
-        for(uint32_t b = 0; b < M; ++b){
-            double* d = pl->da + 2u * (size_t)n * b;
-            f16_inv_r8_only(d, n, pl);
-            f16_mem_ir22(d, n, tw);
+        if(F16_PFA3X2 && M == 3u){
+            for(uint32_t h = 0; h < 6; ++h)
+                f16_inv_r8_only_full(pl->da + (size_t)n * h, n / 2u, pl);
+        }else{
+            const double* tw = pl->tw22[__builtin_ctz(n)];
+            for(uint32_t b = 0; b < M; ++b){
+                double* d = pl->da + 2u * (size_t)n * b;
+                f16_inv_r8_only(d, n, pl);
+                f16_mem_ir22(d, n, tw);
+            }
         }
         if(!f16_pfa_emit(pl->padr, pl->da, n, M, pl)) return 0;
     }
