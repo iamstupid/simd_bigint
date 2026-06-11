@@ -83,8 +83,11 @@ int main(void){
 
     // deep strip-mining: several full strips plus assorted remainders
     const size_t strips[][2] = {{700, 90}, {730, 100}, {1100, 96}, {640, 86},
-                                {903, 129}, {1000, 88}, {520, 100}, {560, 86}};
-    for(int k = 0; k < 8; k++){
+                                {903, 129}, {1000, 88}, {520, 100}, {560, 86},
+                                // sliver-guard shapes: an mod 2bn in [0, 8]
+                                {640, 80}, {645, 80}, {1040, 130}, {482, 96},
+                                {966, 96}, {1287, 160}, {833, 104}};
+    for(int k = 0; k < 15; k++){
         fails += run_case(&sc, strips[k][0], strips[k][1]); cases++;
     }
 

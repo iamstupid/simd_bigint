@@ -709,6 +709,28 @@ static inline int u52_toom33_shape_ok(uint64_t an, uint64_t bn){
 static int mul_u52_stripmine(pvec pp, cpvec a, cpvec b, uint64_t an, uint64_t bn, scratch *sc){
     SCRATCH(sc);
     pvec ws = SALLOC(sc, _vec, u52_vec_count(4*bn));
+    // Sliver guard: when an mod 2bn <= 8, the natural 2bn slicing leaves an
+    // awkward near-empty tail; derive equalized widths from an instead
+    // (every block 2bn + <=4 limbs, still canonical toom42 territory, and no
+    // dimension ever degenerates to <= 8).
+    if(an % (2*bn) <= 8 && (an + bn) / (2*bn) >= 2){
+        const uint64_t nblk = (an + bn) / (2*bn);
+        uint64_t done = 0;
+        for(uint64_t i = 0; i < nblk; ++i){
+            const uint64_t w = an / nblk + (i < an % nblk ? 1 : 0);
+            if(i == 0){
+                mul_u52_dispatch_canon(pp, a, b, w, bn, sc);
+            }else{
+                mul_u52_dispatch_canon(ws, u52_cpvec_add(a, done), b, w, bn, sc);
+                pvec seam = u52_pvec_add(pp, done);
+                add_nc_52(seam, (cpvec)seam, (cpvec)ws, bn);
+                memcpy((uint64_t *)(void *)pp + done + bn,
+                       (const uint64_t *)(const void *)ws + bn, w * 8);
+            }
+            done += w;
+        }
+        return 0;
+    }
     mul_u52_toom42(pp, a, b, 2*bn, bn, sc);
     a = u52_cpvec_add(a, 2*bn); an -= 2*bn;
     pp = u52_pvec_add(pp, 2*bn);
@@ -729,6 +751,16 @@ static int mul_u52_stripmine(pvec pp, cpvec a, cpvec b, uint64_t an, uint64_t bn
     return 0;
 }
 
+
+
+// Measurement-based dispatch: per ratio band, evaluate 2-3 candidate
+// solutions with the fitted cost curves and recurse into the cheapest.
+// Direct algorithms are costed at their canonical-shape curve; compositions
+// (strip-mining, halve-and-seam) sum their parts. Continuous costs make the
+// choice stable through u52-size quantization wobble (no cutpoint flapping),
+// and shapes between canonical ratios pick whichever neighbor is truly
+// cheaper at that size. bn <= 32 exits straight to basecase so the selection
+// cost is paid only where it is negligible.
 static int mul_u52_dispatch(pvec r, cpvec a, cpvec b, uint64_t an, uint64_t bn, scratch *s) {
     if(!an || !bn) return 0;
     if(an < bn){
