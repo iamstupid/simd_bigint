@@ -59,6 +59,36 @@ static inline uint64_t u52_from_u64(pvec r, const uint64_t *ap, uint64_t an){
 
 // ---- public entry ------------------------------------------------------
 
+#ifndef SIMD_MPN_FFT
+#define SIMD_MPN_FFT 1
+#endif
+#if SIMD_MPN_FFT
+#include "fft16.h"
+
+// FFT/toom frontier. FFT cost is a function of an+bn only (~F ns per total
+// limb); the toom route's per-an-limb cost converges, for an >> bn, to a
+// smooth function S(bn) of bn alone (2bn x bn strip blocks). Route to FFT
+// iff S(bn)*an > F*(an+bn). S measured at an = 32*bn (bench sbn_table.csv,
+// T22 = 96), q8 fixed point, bn in steps of 8; beyond the table S > 2F so
+// FFT wins for every shape. F = 5.0 ns (empirical median; the frontier is
+// where both routes tie, so the rule's slop costs only second-order time).
+static const uint16_t simd_mpn_fft_sq8[48] = {
+     214,  267,  353,  438,  531,  624,  671,  773,  865, 1149,
+    1161, 1237, 1229, 1315, 1374, 1400, 1465, 1539, 1559, 1791,
+    1852, 1867, 1949, 1920, 2023, 1929, 2015, 2091, 2064, 2183,
+    2166, 2189, 2257, 2366, 2332, 2403, 2416, 2496, 2492, 2633,
+    2637, 2656, 2691, 2718, 2694, 2752, 2800, 2825,
+};
+#define SIMD_MPN_FFT_FQ8 1280u   /* 5.0 ns in q8 */
+
+static inline int simd_mpn_fft_profitable(uint64_t an, uint64_t bn){
+    if(2u * (an + bn) > F16_MAX_N_C) return 0;     /* FFT band cap */
+    if(bn > 384) return 1;                         /* S(bn) > 2F: always */
+    uint64_t s_q8 = simd_mpn_fft_sq8[(bn - 1) >> 3];
+    return s_q8 * an > (uint64_t)SIMD_MPN_FFT_FQ8 * (an + bn);
+}
+#endif
+
 // rp[0 .. an+bn) = {ap, an} * {bp, bn} on packed u64 limbs. Operands may come
 // in either order; rp must not overlap the inputs.
 static inline void simd_mpn_mul(uint64_t *rp, const uint64_t *ap, uint64_t an,
@@ -69,6 +99,11 @@ static inline void simd_mpn_mul(uint64_t *rp, const uint64_t *ap, uint64_t an,
     }
     if(an <= 6)
         return simd_mpn_mul_basecase_le6(rp, ap, an, bp, bn);
+#if SIMD_MPN_FFT
+    if(simd_mpn_fft_profitable(an, bn) &&
+       fft16_mul(rp, ap, (ptrdiff_t)an, bp, (ptrdiff_t)bn))
+        return;
+#endif
 
     scratch *sc = scratch_thread();
     SCRATCH(sc);

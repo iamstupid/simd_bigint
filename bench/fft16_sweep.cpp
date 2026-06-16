@@ -29,10 +29,10 @@ int main(int argc, char** argv){
     std::vector<size_t> sizes;
     for(int k = 0; ; ++k){
         size_t n = (size_t)llround(128.0 * std::pow(2.0, k / 16.0));
-        if(n > 16384) break;
+        if(n > 131072) break;
         if(sizes.empty() || n != sizes.back()) sizes.push_back(n);
     }
-    std::vector<uint64_t> A(16384), B(16384), R(32768 + 16), REF(32768 + 16);
+    std::vector<uint64_t> A(131072), B(131072), R(262144 + 16), REF(262144 + 16);
     for(auto& x : A) x = xr();
     for(auto& x : B) x = xr();
 
@@ -42,7 +42,7 @@ int main(int argc, char** argv){
         if(time_f16){
             if(!fft16_mul(R.data(), A.data(), (ptrdiff_t)n, B.data(), (ptrdiff_t)n)) continue;
         }else{
-            if(!fft::mul(R.data(), A.data(), (ptrdiff_t)n, B.data(), (ptrdiff_t)n)) continue;
+            if(!fft::mul_auto(R.data(), A.data(), (ptrdiff_t)n, B.data(), (ptrdiff_t)n)) continue;
         }
         if(memcmp(R.data(), REF.data(), 2 * n * 8)){
             fprintf(stderr, "MISMATCH n=%zu\n", n);
@@ -57,7 +57,7 @@ int main(int argc, char** argv){
                     fft16_mul(R.data(), A.data(), (ptrdiff_t)n, B.data(), (ptrdiff_t)n);
             else
                 for(long q = 0; q < reps; ++q)
-                    fft::mul(R.data(), A.data(), (ptrdiff_t)n, B.data(), (ptrdiff_t)n);
+                    fft::mul_auto(R.data(), A.data(), (ptrdiff_t)n, B.data(), (ptrdiff_t)n);
             tp[p] = (now() - t0) / reps;
         }
         qsort(tp, PASSES, 8, cmpd);

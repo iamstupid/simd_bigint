@@ -24,9 +24,9 @@ ns = sorted(set(f16) & set(ref))
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 9), sharex=True,
                                height_ratios=[2.2, 1])
 ax1.plot(ns, [ref[n] for n in ns], lw=1.1, color="tab:orange",
-         label="int_fft reference (AVX2, U16)")
+         label="int_fft reference (AVX2, mul_auto bands)")
 ax1.plot(ns, [f16[n] for n in ns], lw=1.1, color="tab:blue",
-         label="fft16 (AVX-512, U16)")
+         label="fft16 (AVX-512, U16/centered bands)")
 ax1.set_xscale("log", base=2)
 ax1.set_ylabel("ns / input limb")
 ax1.set_title("balanced mul, an = bn = n, 1/16-octave grid (solo-per-process)")
@@ -45,8 +45,8 @@ fig.savefig(out)
 print(f"wrote {out}")
 
 print(f"{'band':>16} | {'ref':>6} | {'fft16':>6} | {'ratio':>6}")
-for lo, hi in ((128, 256), (256, 512), (512, 1024), (1024, 2048),
-               (2048, 4096), (4096, 8192), (8192, 16385)):
+for lo, hi in ((128, 512), (512, 2048), (2048, 8192), (8192, 16385),
+               (16385, 32769), (32769, 65537), (65537, 131073)):
     rs = [ref[n] for n in ns if lo <= n < hi]
     fs = [f16[n] for n in ns if lo <= n < hi]
     qs = [ref[n] / f16[n] for n in ns if lo <= n < hi]

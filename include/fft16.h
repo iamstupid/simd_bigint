@@ -187,7 +187,10 @@ static inline void f_idft8(fcv v[8]){
 /* plan: twiddle tables, decode shuffles, workspace                    */
 /* ------------------------------------------------------------------ */
 #define F16_MAX_R8 4
-#define F16_MAX_LG 17
+#define F16_MAX_LG 21
+#ifndef F16_FORCE_CENTERED
+#define F16_FORCE_CENTERED 0   /* test hook: centered codec at every size */
+#endif
 
 /* per-transform stage shape, derived from lg(n) alone */
 typedef struct {
@@ -242,10 +245,17 @@ typedef struct {
     _Alignas(64) double wt5[5 * 16];    /* PFA lane fixup w_5^{b*(l%5)} */
     _Alignas(64) double wt7[7 * 16];    /* PFA lane fixup w_7^{b*(l%7)} */
     __m512i  dec_idx[4];        /* u16 digit decode shuffles   */
+    __m512i  dec_idxc[4];       /* centered variant: bytes at dword 2-3 */
     int      leaf_init;
     /* workspace */
     double*  da;  double* db;   /* 2N doubles each */
-    uint64_t* pada; uint64_t* padb; uint64_t* padr;  /* N/2 limbs each */
+    uint64_t* pca; uint64_t* pcb; /* xor-centered staging: the operand read
+                                   * streams of the BW-bound centered band
+                                   * alias unpredictably against the spectra
+                                   * when read in-place (caller-controlled
+                                   * addresses, measured up to 2x); staging
+                                   * normalizes the layout. */
+    uint64_t* pcr;                /* result staging, same reason */
     size_t   cap_n;             /* allocation size */
 } f16_plan;
 
@@ -334,14 +344,43 @@ static inline void f16_leaf_init(f16_plan* pl){
         }
         for(int i = 32; i < 64; ++i) idx[i] = (char)0x40;
         memcpy(&pl->dec_idx[v], idx, 64);
+        /* centered: digit bytes at dword bytes 2-3 (sign-extend via srai) */
+        char idc[64];
+        for(int i = 0; i < 64; ++i) idc[i] = (char)0x40;
+        for(int l = 0; l < 8; ++l){
+            int digit = (v >> 1) * 16 + 2 * l + (v & 1);
+            idc[l * 4 + 2] = (char)(digit * 2);
+            idc[l * 4 + 3] = (char)(digit * 2 + 1);
+        }
+        memcpy(&pl->dec_idxc[v], idc, 64);
     }
     pl->leaf_init = 1;
 }
 
-/* build the len-2^lg r22 unroll-2 table: per iter {w1a, w2a, w1b, w2b} */
+/* Tables for stage lengths >= 2^F16_TWC_MIN_LG are stored COMPACT (w1
+ * only, 4x smaller): the other entries are derived in-kernel (w1b =
+ * w1a * w^8, w2 = w1^2, W1o = rot8(W1), W4 = W2^2) -- a few cmuls per
+ * group against megabytes of table stream at the DRAM-bound sizes.
+ * Derived twiddles carry ~2-3 ulp; the affected lengths sit in the
+ * centered band's 4x precision headroom (re-probed). */
+#ifndef F16_TWC_MIN_LG
+#define F16_TWC_MIN_LG 16
+#endif
+/* build the len-2^lg r22 unroll-2 table: per iter {w1a, w2a, w1b, w2b},
+ * or compact {w1a} for big lengths */
 static inline void f16_build_tw22(f16_plan* pl, unsigned lg){
     if(pl->tw22[lg]) return;
     uint32_t len = 1u << lg;
+    if(lg >= F16_TWC_MIN_LG){
+        /* compact: {w1a, w1b}; the squares are derived (1 ulp) */
+        double* tab = (double*)f16_alloc((size_t)len * 4);
+        for(uint32_t i = 0; i < len / 64u; ++i){
+            f16_twcv(tab + 32u * i,       16u * i,      1, len);
+            f16_twcv(tab + 32u * i + 16u, 16u * i + 8u, 1, len);
+        }
+        pl->tw22[lg] = tab;
+        return;
+    }
     double* tab = (double*)f16_alloc((size_t)len * 8);
     for(uint32_t i = 0; i < len / 64u; ++i){
         double* d = tab + 64u * i;
@@ -353,10 +392,21 @@ static inline void f16_build_tw22(f16_plan* pl, unsigned lg){
     }
     pl->tw22[lg] = tab;
 }
-/* build the len-2^lg r8 stage table: per iter {W1, W1*w8, W2, W4} */
+/* build the len-2^lg r8 stage table: per iter {W1, W1*w8, W2, W4}, or
+ * compact {W1} for big lengths */
 static inline void f16_build_tw8(f16_plan* pl, unsigned lg){
     if(pl->tw8[lg]) return;
     uint32_t len = 1u << lg;
+    if(lg >= F16_TWC_MIN_LG){
+        /* compact: {W1, W2}; W1o = rot8(W1), W4 = W2^2 (1 ulp each) */
+        double* tab = (double*)f16_alloc((size_t)len * 4);
+        for(uint32_t i = 0; i < len / 64u; ++i){
+            f16_twcv(tab + 32u * i,       8u * i, 1, len);
+            f16_twcv(tab + 32u * i + 16u, 8u * i, 2, len);
+        }
+        pl->tw8[lg] = tab;
+        return;
+    }
     double* tab = (double*)f16_alloc((size_t)len * 8);
     for(uint32_t i = 0; i < len / 64u; ++i){
         double* d = tab + 64u * i;
@@ -368,6 +418,44 @@ static inline void f16_build_tw8(f16_plan* pl, unsigned lg){
     }
     pl->tw8[lg] = tab;
 }
+/* load the 4 r22 twiddles for unroll-2 iter (twp walks 64 or 16 doubles) */
+static inline void f16_tw22_get(const double* twp, int compact, fcv c8,
+                                fcv* w1a, fcv* w2a, fcv* w1b, fcv* w2b){
+    if(!compact){
+        w1a->re = _mm512_load_pd(twp);      w1a->im = _mm512_load_pd(twp + 8);
+        w2a->re = _mm512_load_pd(twp + 16); w2a->im = _mm512_load_pd(twp + 24);
+        w1b->re = _mm512_load_pd(twp + 32); w1b->im = _mm512_load_pd(twp + 40);
+        w2b->re = _mm512_load_pd(twp + 48); w2b->im = _mm512_load_pd(twp + 56);
+        return;
+    }
+    w1a->re = _mm512_load_pd(twp);      w1a->im = _mm512_load_pd(twp + 8);
+    w1b->re = _mm512_load_pd(twp + 16); w1b->im = _mm512_load_pd(twp + 24);
+    (void)c8;
+    *w2a = f_mul(*w1a, *w1a);
+    *w2b = f_mul(*w1b, *w1b);
+}
+/* the per-table constant w_len^8 for compact tw22 derivation */
+static inline fcv f16_tw_c8(uint32_t len){
+    double cr, ci;
+    f16_root(&cr, &ci, 8, len);
+    fcv c; c.re = _mm512_set1_pd(cr); c.im = _mm512_set1_pd(ci);
+    return c;
+}
+/* the 4 r8-stage twiddles (twp walks 64 or 16 doubles) */
+static inline void f16_tw8_get(const double* twp, int compact,
+                               fcv* W1, fcv* W1o, fcv* W2, fcv* W4){
+    if(!compact){
+        W1->re  = _mm512_load_pd(twp);      W1->im  = _mm512_load_pd(twp + 8);
+        W1o->re = _mm512_load_pd(twp + 16); W1o->im = _mm512_load_pd(twp + 24);
+        W2->re  = _mm512_load_pd(twp + 32); W2->im  = _mm512_load_pd(twp + 40);
+        W4->re  = _mm512_load_pd(twp + 48); W4->im  = _mm512_load_pd(twp + 56);
+        return;
+    }
+    W1->re = _mm512_load_pd(twp);      W1->im = _mm512_load_pd(twp + 8);
+    W2->re = _mm512_load_pd(twp + 16); W2->im = _mm512_load_pd(twp + 24);
+    *W1o = f_rot81(*W1);
+    *W4  = f_mul(*W2, *W2);
+}
 
 /* branch = pow2 transform/branch size (keys the twiddle + PQ tables);
  * nfull = full transform size in complex (keys workspace capacity; equals
@@ -378,12 +466,15 @@ static inline void f16_plan_ensure(f16_plan* pl, uint32_t branch, uint32_t nfull
 
     if(nfull > pl->cap_ws){
         free(pl->da); free(pl->db);
-        free(pl->pada); free(pl->padb); free(pl->padr);
         pl->da   = (double*)f16_alloc((size_t)nfull * 16);
         pl->db   = (double*)f16_alloc((size_t)nfull * 16);
-        pl->pada = (uint64_t*)f16_alloc((size_t)nfull * 4 + 64);
-        pl->padb = (uint64_t*)f16_alloc((size_t)nfull * 4 + 64);
-        pl->padr = (uint64_t*)f16_alloc((size_t)nfull * 4 + 64);
+        free(pl->pca); free(pl->pcb); free(pl->pcr);
+        pl->pca = NULL; pl->pcb = NULL; pl->pcr = NULL;
+        if(nfull > (1u << 17) || F16_FORCE_CENTERED){
+            pl->pca = (uint64_t*)f16_alloc((size_t)nfull * 4 + 64);
+            pl->pcb = (uint64_t*)f16_alloc((size_t)nfull * 4 + 64);
+            pl->pcr = (uint64_t*)f16_alloc((size_t)nfull * 4 + 64);
+        }
         pl->cap_ws = nfull;
     }
     if(branch > pl->pq_n){
@@ -418,19 +509,57 @@ static inline void f16_plan_ensure(f16_plan* pl, uint32_t branch, uint32_t nfull
 /* ------------------------------------------------------------------ */
 /* forward: fused decode + r22 unroll-2 at len N                       */
 /* ------------------------------------------------------------------ */
+/* operand stream loaders: bounds-masked (fault-suppressed) tails so input
+ * is read directly from the caller's buffers; centering = one (masked)
+ * xor with 0x8000 per lane, zeroed lanes stay zero. rem = valid limbs left. */
+static inline __m512i f16_raw8(const uint64_t* p, int64_t rem, int cen){
+    const __m512i X = _mm512_set1_epi64((long long)0x8000800080008000ULL);
+    if(rem >= 8){
+        __m512i v = _mm512_loadu_si512((const void*)p);
+        return cen == 1 ? _mm512_xor_si512(v, X) : v;
+    }
+    __mmask8 m = rem <= 0 ? (__mmask8)0 : (__mmask8)(0xFFu >> (8 - rem));
+    __m512i v = _mm512_maskz_loadu_epi64(m, p);
+    return cen == 1 ? _mm512_maskz_xor_epi64(m, v, X) : v;
+}
+static inline __m512i f16_raw4(const uint64_t* p, int64_t rem, int cen){
+    const __m256i X = _mm256_set1_epi64x((long long)0x8000800080008000ULL);
+    __mmask8 m = rem >= 4 ? (__mmask8)0x0F
+               : (rem <= 0 ? (__mmask8)0 : (__mmask8)(0x0Fu >> (4 - rem)));
+    __m256i v = _mm256_maskz_loadu_epi64(m, p);
+    if(cen == 1) v = _mm256_maskz_xor_epi64(m, v, X);
+    return _mm512_castsi256_si512(v);
+}
+static inline __mmask8 f16_st_mask(int64_t rem){
+    return rem >= 8 ? (__mmask8)0xFF
+         : (rem <= 0 ? (__mmask8)0 : (__mmask8)(0xFFu >> (8 - rem)));
+}
+
 static inline __m512d f16_dec1(__m512i raw, __m512i idx){
     __m512i d = _mm512_permutex2var_epi8(raw, idx, _mm512_setzero_si512());
     return _mm512_cvtepu32_pd(_mm512_castsi512_si256(d));
 }
+/* centered: idx places the (pre-xored) digit at dword bytes 2-3; the
+ * arithmetic shift sign-extends, giving d - 2^15 in [-2^15, 2^15) */
+static inline __m512d f16_dec1c(__m512i raw, __m512i idx){
+    __m512i d = _mm512_permutex2var_epi8(raw, idx, _mm512_setzero_si512());
+    return _mm512_cvtepi32_pd(_mm512_castsi512_si256(_mm512_srai_epi32(d, 16)));
+}
 /* decode one zmm of limbs (16 complex) into 2 tiles */
-static inline void f16_dec2(fcv* t0, fcv* t1, const uint64_t* src, const __m512i* IDX){
-    __m512i raw = _mm512_loadu_si512((const void*)src);
-    t0->re = f16_dec1(raw, IDX[0]); t0->im = f16_dec1(raw, IDX[1]);
-    t1->re = f16_dec1(raw, IDX[2]); t1->im = f16_dec1(raw, IDX[3]);
+static inline void f16_dec2(fcv* t0, fcv* t1, __m512i raw,
+                            const __m512i* IDX, int cen){
+    if(cen){
+        t0->re = f16_dec1c(raw, IDX[0]); t0->im = f16_dec1c(raw, IDX[1]);
+        t1->re = f16_dec1c(raw, IDX[2]); t1->im = f16_dec1c(raw, IDX[3]);
+    }else{
+        t0->re = f16_dec1(raw, IDX[0]); t0->im = f16_dec1(raw, IDX[1]);
+        t1->re = f16_dec1(raw, IDX[2]); t1->im = f16_dec1(raw, IDX[3]);
+    }
 }
 
 static inline void f16_input_stage(double* data, const uint64_t* src,
-                                   uint32_t n, const f16_plan* pl){
+                                   int64_t cnt, uint32_t n,
+                                   const f16_plan* pl, int cen){
     const uint32_t l = n / 4u;                       /* complex per quarter */
     double* p0 = data;
     double* p1 = data + 2u * (size_t)l;
@@ -440,17 +569,23 @@ static inline void f16_input_stage(double* data, const uint64_t* src,
     const uint64_t* s1 = src + l / 2u;               /* limbs: l cx = l/2 */
     const uint64_t* s2 = src + l;
     const uint64_t* s3 = src + 3u * (l / 2u);
+    int64_t r0 = cnt, r1 = cnt - (int64_t)(l / 2u);
+    int64_t r2 = cnt - (int64_t)l, r3 = cnt - 3 * (int64_t)(l / 2u);
     const double* twp = pl->tw22[__builtin_ctz(n)];
-    const __m512i* IDX = pl->dec_idx;
+    const int twc = __builtin_ctz(n) >= F16_TWC_MIN_LG;
+    const fcv c8 = f16_tw_c8(n);
+    const __m512i* IDX = cen ? pl->dec_idxc : pl->dec_idx;
     for(uint32_t i = 0; i < l / 16u; ++i){
         fcv a0, a0b, a1, a1b, a2, a2b, a3, a3b;
-        f16_dec2(&a0, &a0b, s0, IDX);
-        f16_dec2(&a1, &a1b, s1, IDX);
-        f16_dec2(&a2, &a2b, s2, IDX);
-        f16_dec2(&a3, &a3b, s3, IDX);
+        f16_dec2(&a0, &a0b, f16_raw8(s0, r0, cen), IDX, cen);
+        f16_dec2(&a1, &a1b, f16_raw8(s1, r1, cen), IDX, cen);
+        f16_dec2(&a2, &a2b, f16_raw8(s2, r2, cen), IDX, cen);
+        f16_dec2(&a3, &a3b, f16_raw8(s3, r3, cen), IDX, cen);
         s0 += 8; s1 += 8; s2 += 8; s3 += 8;
+        r0 -= 8; r1 -= 8; r2 -= 8; r3 -= 8;
 
-        fcv w1 = f_load(twp), w2 = f_load(twp + 16);
+        fcv w1, w2, w1B, w2B;
+        f16_tw22_get(twp, twc, c8, &w1, &w2, &w1B, &w2B);
         fcv b0 = f_add(a0, a2);
         fcv b2 = f_mul(f_sub(a0, a2), w1);
         fcv b1 = f_add(a1, a3);
@@ -460,8 +595,8 @@ static inline void f16_input_stage(double* data, const uint64_t* src,
         f_store(p2, f_add(b2, b3));
         f_store(p3, f_mul(f_sub(b2, b3), w2));
 
-        w1 = f_load(twp + 32); w2 = f_load(twp + 48);
-        twp += 64;
+        w1 = w1B; w2 = w2B;
+        twp += twc ? 32 : 64;
         b0 = f_add(a0b, a2b);
         b2 = f_mul(f_sub(a0b, a2b), w1);
         b1 = f_add(a1b, a3b);
@@ -484,9 +619,13 @@ static inline void f16_mem_r22(double* data, uint32_t n, const double* tw){
     double* p1 = data + 2u * (size_t)l;
     double* p2 = data + 4u * (size_t)l;
     double* p3 = data + 6u * (size_t)l;
+    const int twc = __builtin_ctz(n) >= F16_TWC_MIN_LG;
+    const fcv c8 = f16_tw_c8(n);
     for(uint32_t i = 0; i < l / 16u; ++i){
+        fcv w1a, w2a, w1b, w2b;
+        f16_tw22_get(tw, twc, c8, &w1a, &w2a, &w1b, &w2b);
         for(int u = 0; u < 2; ++u){
-            fcv w1 = f_load(tw + 32 * u), w2 = f_load(tw + 32 * u + 16);
+            fcv w1 = u ? w1b : w1a, w2 = u ? w2b : w2a;
             fcv a0 = f_load(p0 + 16 * u), a1 = f_load(p1 + 16 * u);
             fcv a2 = f_load(p2 + 16 * u), a3 = f_load(p3 + 16 * u);
             fcv b0 = f_add(a0, a2), b2 = f_mul(f_sub(a0, a2), w1);
@@ -496,7 +635,7 @@ static inline void f16_mem_r22(double* data, uint32_t n, const double* tw){
             f_store(p2 + 16 * u, f_add(b2, b3));
             f_store(p3 + 16 * u, f_mul(f_sub(b2, b3), w2));
         }
-        tw += 64;
+        tw += twc ? 32 : 64;
         p0 += 32; p1 += 32; p2 += 32; p3 += 32;
     }
 }
@@ -506,9 +645,13 @@ static inline void f16_mem_ir22(double* data, uint32_t n, const double* tw){
     double* p1 = data + 2u * (size_t)l;
     double* p2 = data + 4u * (size_t)l;
     double* p3 = data + 6u * (size_t)l;
+    const int twc = __builtin_ctz(n) >= F16_TWC_MIN_LG;
+    const fcv c8 = f16_tw_c8(n);
     for(uint32_t i = 0; i < l / 16u; ++i){
+        fcv w1a, w2a, w1b, w2b;
+        f16_tw22_get(tw, twc, c8, &w1a, &w2a, &w1b, &w2b);
         for(int u = 0; u < 2; ++u){
-            fcv w1 = f_load(tw + 32 * u), w2 = f_load(tw + 32 * u + 16);
+            fcv w1 = u ? w1b : w1a, w2 = u ? w2b : w2a;
             fcv y0 = f_load(p0 + 16 * u), y1 = f_load(p1 + 16 * u);
             fcv y2 = f_load(p2 + 16 * u), y3 = f_load(p3 + 16 * u);
             fcv s  = f_mulc(y1, w2);
@@ -522,7 +665,7 @@ static inline void f16_mem_ir22(double* data, uint32_t n, const double* tw){
             f_store(p1 + 16 * u, f_add(b1, s));
             f_store(p3 + 16 * u, f_sub(b1, s));
         }
-        tw += 64;
+        tw += twc ? 32 : 64;
         p0 += 32; p1 += 32; p2 += 32; p3 += 32;
     }
 }
@@ -663,20 +806,24 @@ static inline void f16_kmasks(uint8_t km[8], uint32_t M){
  * inputs x[a] assemble from the stripes by constant lane-residue masks. */
 __attribute__((always_inline))
 static inline void f16_pfa_input_impl(double* data, const uint64_t* src,
-                                      uint32_t n, uint32_t M, const f16_plan* pl){
+                                      int64_t cnt,
+                                      uint32_t n, uint32_t M, const f16_plan* pl,
+                                      int cen){
     uint8_t km[8]; f16_kmasks(km, M);
-    const uint64_t* s[7]; double* p[7]; uint32_t r[7];
+    const uint64_t* s[7]; double* p[7]; uint32_t r[7]; int64_t rm[7];
     for(uint32_t b = 0; b < M; ++b){
         s[b] = src + (size_t)b * (n / 2u);
+        rm[b] = cnt - (int64_t)b * (int64_t)(n / 2u);
         p[b] = data + 2u * (size_t)n * b;
         r[b] = (uint32_t)(((uint64_t)b * n) % M);
     }
-    const __m512i* IDX = pl->dec_idx;
+    const __m512i* IDX = cen ? pl->dec_idxc : pl->dec_idx;
     for(uint32_t i = 0; i < n / 16u; ++i){
         fcv t0[7], t1[7];
         for(uint32_t b = 0; b < M; ++b){
-            f16_dec2(&t0[b], &t1[b], s[b], IDX);
+            f16_dec2(&t0[b], &t1[b], f16_raw8(s[b], rm[b], cen), IDX, cen);
             s[b] += 8;
+            rm[b] -= 8;
         }
         for(int u = 0; u < 2; ++u){
             const fcv* t = u ? t1 : t0;
@@ -707,27 +854,30 @@ static inline void f16_pfa_input_impl(double* data, const uint64_t* src,
  * the merge form above is cheaper than the extra cmuls. */
 __attribute__((always_inline))
 static inline void f16_pfa_input_tw(double* data, const uint64_t* src,
+                                    int64_t cnt,
                                     uint32_t n, uint32_t M, const double* wt,
-                                    const f16_plan* pl){
+                                    const f16_plan* pl, int cen){
     /* stripe POINTERS are held in residue order (sp[rho] = stripe whose
      * lane-0 residue is currently rho) and rotated by the constant
      * 16 mod M each iteration, so every vector-slot index is compile-time
      * constant and t[]/x[]/y[] fully enregister; the runtime relabel is
      * GPR pointer renaming only. Sub-tile 1 relabels by the constant
      * shift 8 mod M. */
-    const uint64_t* sp[7]; double* p[7];
+    const uint64_t* sp[7]; double* p[7]; int64_t rm[7];
     for(uint32_t b = 0; b < M; ++b){
         uint32_t rho = (uint32_t)(((uint64_t)b * n) % M);
         sp[rho] = src + (size_t)b * (n / 2u);
+        rm[rho] = cnt - (int64_t)b * (int64_t)(n / 2u);
         p[b] = data + 2u * (size_t)n * b;
     }
-    const __m512i* IDX = pl->dec_idx;
+    const __m512i* IDX = cen ? pl->dec_idxc : pl->dec_idx;
     const uint32_t sh8 = 8u % M, sh16 = 16u % M;
     for(uint32_t i = 0; i < n / 16u; ++i){
         fcv t0[7], t1[7], x[7], y[7];
         for(uint32_t rho = 0; rho < M; ++rho){
-            f16_dec2(&t0[rho], &t1[rho], sp[rho], IDX);
+            f16_dec2(&t0[rho], &t1[rho], f16_raw8(sp[rho], rm[rho], cen), IDX, cen);
             sp[rho] += 8;
+            rm[rho] -= 8;
         }
         f16_pfa_bfly(t0, y, M, 0);
         for(uint32_t b = 0; b < M; ++b){
@@ -744,9 +894,12 @@ static inline void f16_pfa_input_tw(double* data, const uint64_t* src,
             f_store(p[b] + 16, f_mul(y[b], w));
             p[b] += 32;
         }
-        const uint64_t* tmp[7];
-        for(uint32_t rho = 0; rho < M; ++rho) tmp[(rho + sh16) % M] = sp[rho];
-        for(uint32_t rho = 0; rho < M; ++rho) sp[rho] = tmp[rho];
+        const uint64_t* tmp[7]; int64_t tr[7];
+        for(uint32_t rho = 0; rho < M; ++rho){
+            tmp[(rho + sh16) % M] = sp[rho];
+            tr[(rho + sh16) % M] = rm[rho];
+        }
+        for(uint32_t rho = 0; rho < M; ++rho){ sp[rho] = tmp[rho]; rm[rho] = tr[rho]; }
     }
 }
 /* A/B'd end-to-end vs the plain radix-3 + mem_r22 pipeline: 3x2 LOSES
@@ -764,23 +917,29 @@ static inline void f16_pfa_input_tw(double* data, const uint64_t* src,
  * per branch). Each branch-half is then an independent n/2 transform that
  * starts directly at the r8 cascade -- no separate mem_r22 sweep. */
 static inline void f16_pfa3x2_input(double* data, const uint64_t* src,
-                                    uint32_t n, const f16_plan* pl){
+                                    int64_t cnt,
+                                    uint32_t n, const f16_plan* pl, int cen){
     uint8_t km[8]; f16_kmasks(km, 3u);
     const uint64_t* sj[3]; const uint64_t* sk[3];
     double* pe[3]; double* po[3];
+    int64_t mj[3], mk[3];
     uint32_t rj[3], rk[3];
     for(uint32_t b = 0; b < 3; ++b){
         sj[b] = src + (size_t)b * (n / 2u);
         sk[b] = sj[b] + n / 4u;
+        mj[b] = cnt - (int64_t)b * (int64_t)(n / 2u);
+        mk[b] = mj[b] - (int64_t)(n / 4u);
         pe[b] = data + 2u * (size_t)n * b;
         po[b] = pe[b] + n;
         rj[b] = (uint32_t)(((uint64_t)b * n) % 3u);
         rk[b] = (uint32_t)(((uint64_t)b * n + n / 2u) % 3u);
     }
-    const __m512i* IDX = pl->dec_idx;
+    const __m512i* IDX = cen ? pl->dec_idxc : pl->dec_idx;
     /* the tw22 w1 entries span j in [0, n/4); the second quarter's twiddle
      * is w_n^{j} = i * w_n^{j - n/4} (e^{+} convention), so phase 2 rewinds
      * the table and applies f_j. */
+    const int twc3 = __builtin_ctz(n) >= F16_TWC_MIN_LG;
+    const fcv c83 = f16_tw_c8(n);
     const double* tw = pl->tw22[__builtin_ctz(n)];
     for(uint32_t i = 0; i < n / 32u; ++i){
         if(i == n / 64u) tw = pl->tw22[__builtin_ctz(n)];
@@ -788,16 +947,14 @@ static inline void f16_pfa3x2_input(double* data, const uint64_t* src,
         for(int sub = 0; sub < 2; ++sub){
             fcv tj[3], tk[3];
             for(uint32_t b = 0; b < 3; ++b){
-                __m512i raw = _mm512_castsi256_si512(
-                    _mm256_loadu_si256((const __m256i*)sj[b]));
-                tj[b].re = f16_dec1(raw, IDX[0]);
-                tj[b].im = f16_dec1(raw, IDX[1]);
-                sj[b] += 4;
-                raw = _mm512_castsi256_si512(
-                    _mm256_loadu_si256((const __m256i*)sk[b]));
-                tk[b].re = f16_dec1(raw, IDX[0]);
-                tk[b].im = f16_dec1(raw, IDX[1]);
-                sk[b] += 4;
+                __m512i raw = f16_raw4(sj[b], mj[b], cen);
+                tj[b].re = cen ? f16_dec1c(raw, IDX[0]) : f16_dec1(raw, IDX[0]);
+                tj[b].im = cen ? f16_dec1c(raw, IDX[1]) : f16_dec1(raw, IDX[1]);
+                sj[b] += 4; mj[b] -= 4;
+                raw = f16_raw4(sk[b], mk[b], cen);
+                tk[b].re = cen ? f16_dec1c(raw, IDX[0]) : f16_dec1(raw, IDX[0]);
+                tk[b].im = cen ? f16_dec1c(raw, IDX[1]) : f16_dec1(raw, IDX[1]);
+                sk[b] += 4; mk[b] -= 4;
             }
             fcv xj[3], xk[3], yj[3], yk[3];
             for(uint32_t a = 0; a < 3; ++a){
@@ -813,8 +970,10 @@ static inline void f16_pfa3x2_input(double* data, const uint64_t* src,
             }
             f16_pfa_bfly(xj, yj, 3u, 0);
             f16_pfa_bfly(xk, yk, 3u, 0);
-            fcv w; w.re = _mm512_load_pd(tw + 32 * sub);
-                   w.im = _mm512_load_pd(tw + 32 * sub + 8);
+            fcv w; w.re = _mm512_load_pd(tw);
+                   w.im = _mm512_load_pd(tw + 8);
+            if(sub){ w.re = _mm512_load_pd(tw + (twc3 ? 16 : 32));
+                     w.im = _mm512_load_pd(tw + (twc3 ? 24 : 40)); }
             if(ph2) w = f_j(w);
             for(uint32_t b = 0; b < 3; ++b){
                 f_store(pe[b], f_add(yj[b], yk[b]));
@@ -824,23 +983,24 @@ static inline void f16_pfa3x2_input(double* data, const uint64_t* src,
                 rk[b] = (rk[b] + 8u) % 3u;
             }
         }
-        tw += 64;
+        tw += twc3 ? 32 : 64;
     }
 }
 
 /* literal-M dispatcher: lets the compiler specialize the impl per M so the
  * x[]/y[] arrays enregister and the residue arithmetic strength-reduces */
-static inline void f16_pfa_input(double* data, const uint64_t* src,
-                                 uint32_t n, uint32_t M, const f16_plan* pl){
+static inline void f16_pfa_input(double* data, const uint64_t* src, int64_t cnt,
+                                 uint32_t n, uint32_t M, const f16_plan* pl,
+                                 int cen){
     switch(M){
     /* end-to-end bisect (bench/pfa_io_bench + full-mul): the merge input
      * wins in the full-mul context for M=3 (and gains the fused r2);
      * rotated-tw wins for M=5/7. */
-    case 3:  if(F16_PFA3X2) f16_pfa3x2_input(data, src, n, pl);
-             else            f16_pfa_input_impl(data, src, n, 3u, pl);
+    case 3:  if(F16_PFA3X2) f16_pfa3x2_input(data, src, cnt, n, pl, cen);
+             else            f16_pfa_input_impl(data, src, cnt, n, 3u, pl, cen);
              break;
-    case 5:  f16_pfa_input_tw(data, src, n, 5u, pl->wt5, pl); break;
-    default: f16_pfa_input_tw(data, src, n, 7u, pl->wt7, pl); break;
+    case 5:  f16_pfa_input_tw(data, src, cnt, n, 5u, pl->wt5, pl, cen); break;
+    default: f16_pfa_input_tw(data, src, cnt, n, 7u, pl->wt7, pl, cen); break;
     }
 }
 
@@ -860,12 +1020,13 @@ static inline void f16_r8_stage(double* data, uint32_t n, uint32_t len,
         double* p6 = p5 + st;
         double* p7 = p6 + st;
         const double* twp = tw;
+        const int twc = __builtin_ctz(len) >= F16_TWC_MIN_LG;
         for(uint32_t t = 0; t < len / 64u; ++t){
             fcv a0 = f_load(p0), a1 = f_load(p1), a2 = f_load(p2), a3 = f_load(p3);
             fcv a4 = f_load(p4), a5 = f_load(p5), a6 = f_load(p6), a7 = f_load(p7);
-            fcv W1  = f_load(twp), W1o = f_load(twp + 16);
-            fcv W2  = f_load(twp + 32), W4 = f_load(twp + 48);
-            twp += 64;
+            fcv W1, W1o, W2, W4;
+            f16_tw8_get(twp, twc, &W1, &W1o, &W2, &W4);
+            twp += twc ? 32 : 64;
 
             fcv e0 = f_add(a0, a4), e1 = f_add(a1, a5);
             fcv e2 = f_add(a2, a6), e3 = f_add(a3, a7);
@@ -905,10 +1066,11 @@ static inline void f16_ir8_stage(double* data, uint32_t n, uint32_t len,
         double* p6 = p5 + st;
         double* p7 = p6 + st;
         const double* twp = tw;
+        const int twc = __builtin_ctz(len) >= F16_TWC_MIN_LG;
         for(uint32_t t = 0; t < len / 64u; ++t){
-            fcv W1  = f_load(twp), W1o = f_load(twp + 16);
-            fcv W2  = f_load(twp + 32), W4 = f_load(twp + 48);
-            twp += 64;
+            fcv W1, W1o, W2, W4;
+            f16_tw8_get(twp, twc, &W1, &W1o, &W2, &W4);
+            twp += twc ? 32 : 64;
             fcv y0 = f_load(p0), y1 = f_load(p1), y2 = f_load(p2), y3 = f_load(p3);
             /* invert e-half r22 */
             fcv s  = f_mulc(y1, W4);
@@ -1146,67 +1308,90 @@ static inline void f16_ileaf_run(double* d, uint32_t span, uint32_t leaf,
 /* chunk's remaining stages + leaves happen while it is cache-hot.     */
 /* ------------------------------------------------------------------ */
 #ifndef F16_BLOCK
-#define F16_BLOCK 2048u   /* complex; 32 KB of tile data */
+#define F16_BLOCK 2048u   /* L1 tier: 32 KB of tile data */
+#endif
+#ifndef F16_BLOCK2
+#define F16_BLOCK2 32768u /* L2 tier: 512 KB; stages between the tiers run
+                           * inside L2-resident super-chunks instead of
+                           * re-streaming the whole spectrum from L3 */
 #endif
 
 /* r8 stages + leaves of one pow2 transform/branch (everything after its
  * first r22 stage), cache-chunked */
+/* recursive blocking ladder: stages too long for the current tier run as
+ * full-span passes; everything below recurses into tier-sized chunks so a
+ * chunk's remaining stages + leaves happen while it is cache-resident.
+ * Tiers ~ L3-slice / L2 / L1 of tile data. */
+static const uint32_t F16_TIERS[3] = { 131072u, 32768u, F16_BLOCK };
+
+static void f16_fwd_rec(double* d, uint32_t span, const f16_shape* sh,
+                        uint32_t s, unsigned tier, const f16_plan* pl){
+    while(tier < 3 && F16_TIERS[tier] >= span) tier++;
+    if(tier == 3){
+        for(uint32_t ss = s; ss < sh->cnt; ++ss)
+            f16_r8_stage(d, span, sh->len[ss], pl->tw8[__builtin_ctz(sh->len[ss])]);
+        f16_leaf_run(d, span, sh->leaf, pl);
+        return;
+    }
+    uint32_t chunk = F16_TIERS[tier];
+    while(s < sh->cnt && sh->len[s] > chunk){
+        f16_r8_stage(d, span, sh->len[s], pl->tw8[__builtin_ctz(sh->len[s])]);
+        s++;
+    }
+    for(uint32_t base = 0; base < span; base += chunk)
+        f16_fwd_rec(d + 2u * (size_t)base, chunk, sh, s, tier + 1u, pl);
+}
+static void f16_inv_rec(double* d, uint32_t span, const f16_shape* sh,
+                        uint32_t s, unsigned tier, const f16_plan* pl){
+    while(tier < 3 && F16_TIERS[tier] >= span) tier++;
+    if(tier == 3){
+        for(uint32_t ss = sh->cnt; ss-- > s; )
+            f16_ir8_stage(d, span, sh->len[ss], pl->tw8[__builtin_ctz(sh->len[ss])]);
+        return;
+    }
+    uint32_t chunk = F16_TIERS[tier];
+    uint32_t s1 = s;
+    while(s1 < sh->cnt && sh->len[s1] > chunk) s1++;
+    for(uint32_t base = 0; base < span; base += chunk)
+        f16_inv_rec(d + 2u * (size_t)base, chunk, sh, s1, tier + 1u, pl);
+    for(uint32_t ss = s1; ss-- > s; )
+        f16_ir8_stage(d, span, sh->len[ss], pl->tw8[__builtin_ctz(sh->len[ss])]);
+}
+
 static inline void f16_fwd_core(double* data, uint32_t n, const f16_plan* pl){
     f16_shape sh = f16_shape_of(n);
-    uint32_t s = 0;
-    while(s < sh.cnt && sh.len[s] > F16_BLOCK){
-        f16_r8_stage(data, n, sh.len[s], pl->tw8[__builtin_ctz(sh.len[s])]);
-        s++;
-    }
-    uint32_t chunk = s < sh.cnt ? sh.len[s] : (sh.leaf == 128u ? 128u : 64u);
-    for(uint32_t base = 0; base < n; base += chunk){
-        double* d = data + 2u * (size_t)base;
-        for(uint32_t ss = s; ss < sh.cnt; ++ss)
-            f16_r8_stage(d, chunk, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
-        f16_leaf_run(d, chunk, sh.leaf, pl);
-    }
+    f16_fwd_rec(data, n, &sh, 0, 0, pl);
 }
-static inline void f16_fwd(double* data, const uint64_t* src, uint32_t n,
-                           const f16_plan* pl){
-    f16_input_stage(data, src, n, pl);
-    f16_fwd_core(data, n, pl);
-}
-/* full-length cores: first stage is an r8 pass at len m itself */
 static inline void f16_fwd_core_full(double* data, uint32_t m, const f16_plan* pl){
     f16_shape sh = f16_shape_of_full(m);
-    uint32_t s = 0;
-    while(s < sh.cnt && sh.len[s] > F16_BLOCK){
-        f16_r8_stage(data, m, sh.len[s], pl->tw8[__builtin_ctz(sh.len[s])]);
-        s++;
-    }
-    uint32_t chunk = s < sh.cnt ? sh.len[s] : (sh.leaf == 128u ? 128u : 64u);
-    for(uint32_t base = 0; base < m; base += chunk){
-        double* d = data + 2u * (size_t)base;
-        for(uint32_t ss = s; ss < sh.cnt; ++ss)
-            f16_r8_stage(d, chunk, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
-        f16_leaf_run(d, chunk, sh.leaf, pl);
-    }
+    f16_fwd_rec(data, m, &sh, 0, 0, pl);
+}
+/* inverse r8 stages only (leaves already applied by the fused pointwise) */
+static inline void f16_inv_r8_only(double* data, uint32_t n, const f16_plan* pl){
+    f16_shape sh = f16_shape_of(n);
+    f16_inv_rec(data, n, &sh, 0, 0, pl);
 }
 static inline void f16_inv_r8_only_full(double* data, uint32_t m, const f16_plan* pl){
     f16_shape sh = f16_shape_of_full(m);
-    uint32_t s = 0;
-    while(s < sh.cnt && sh.len[s] > F16_BLOCK) s++;
-    uint32_t chunk = s < sh.cnt ? sh.len[s] : (sh.leaf == 128u ? 128u : 64u);
-    if(s < sh.cnt)
-        for(uint32_t base = 0; base < m; base += chunk){
-            double* d = data + 2u * (size_t)base;
-            for(uint32_t ss = sh.cnt; ss-- > s; )
-                f16_ir8_stage(d, chunk, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
-        }
-    for(uint32_t ss = s; ss-- > 0; )
-        f16_ir8_stage(data, m, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
+    f16_inv_rec(data, m, &sh, 0, 0, pl);
+}
+static inline void f16_fwd(double* data, const uint64_t* src, int64_t cnt,
+                           uint32_t n, const f16_plan* pl){
+    f16_input_stage(data, src, cnt, n, pl, 0);
+    f16_fwd_core(data, n, pl);
+}
+static inline void f16_fwd_cen(double* data, const uint64_t* src, int64_t cnt,
+                               uint32_t n, const f16_plan* pl){
+    f16_input_stage(data, src, cnt, n, pl, 1);
+    f16_fwd_core(data, n, pl);
 }
 /* PFA forward. M = 3: the 3x2 input already did the branch's top r2 level,
  * so each branch-half is an independent n/2 transform starting at the r8
  * cascade. M = 5, 7: radix-M input, then mem_r22 + core per branch. */
-static inline void f16_pfa_fwd(double* data, const uint64_t* src, uint32_t n,
-                               uint32_t M, const f16_plan* pl){
-    f16_pfa_input(data, src, n, M, pl);
+static inline void f16_pfa_fwd_x(double* data, const uint64_t* src, int64_t cnt,
+                                 uint32_t n,
+                                 uint32_t M, const f16_plan* pl, int cen){
+    f16_pfa_input(data, src, cnt, n, M, pl, cen);
     if(F16_PFA3X2 && M == 3u){
         for(uint32_t h = 0; h < 6; ++h)
             f16_fwd_core_full(data + (size_t)n * h, n / 2u, pl);
@@ -1219,20 +1404,10 @@ static inline void f16_pfa_fwd(double* data, const uint64_t* src, uint32_t n,
         f16_fwd_core(d, n, pl);
     }
 }
-/* inverse r8 stages only (leaves already applied by the fused pointwise) */
-static inline void f16_inv_r8_only(double* data, uint32_t n, const f16_plan* pl){
-    f16_shape sh = f16_shape_of(n);
-    uint32_t s = 0;
-    while(s < sh.cnt && sh.len[s] > F16_BLOCK) s++;
-    uint32_t chunk = s < sh.cnt ? sh.len[s] : (sh.leaf == 128u ? 128u : 64u);
-    if(s < sh.cnt)
-        for(uint32_t base = 0; base < n; base += chunk){
-            double* d = data + 2u * (size_t)base;
-            for(uint32_t ss = sh.cnt; ss-- > s; )
-                f16_ir8_stage(d, chunk, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
-        }
-    for(uint32_t ss = s; ss-- > 0; )
-        f16_ir8_stage(data, n, sh.len[ss], pl->tw8[__builtin_ctz(sh.len[ss])]);
+static inline void f16_pfa_fwd(double* data, const uint64_t* src, int64_t cnt,
+                               uint32_t n,
+                               uint32_t M, const f16_plan* pl){
+    f16_pfa_fwd_x(data, src, cnt, n, M, pl, 0);
 }
 /* full inverse (leaves + r8): used by the round-trip test path */
 static inline void f16_inv_leaves_r8(double* data, uint32_t n, const f16_plan* pl){
@@ -1585,9 +1760,8 @@ static inline __m512i f16_mround(__m512d x){
         _mm512_castpd_si512(_mm512_add_pd(x, _mm512_castsi512_pd(bias))), bias);
 }
 typedef struct { __m512i lo, hi; } f16_lohi;
-static inline f16_lohi f16_pack2(fcv t0, fcv t1){
-    __m512i re0 = f16_mround(t0.re), im0 = f16_mround(t0.im);
-    __m512i re1 = f16_mround(t1.re), im1 = f16_mround(t1.im);
+static inline f16_lohi f16_pack2i(__m512i re0, __m512i im0,
+                                  __m512i re1, __m512i im1){
     __m512i ul0 = _mm512_add_epi64(re0, _mm512_slli_epi64(im0, 16));
     __m512i uh0 = _mm512_add_epi64(_mm512_srli_epi64(im0, 48),
         _mm512_maskz_set1_epi64(_mm512_cmplt_epu64_mask(ul0, re0), 1));
@@ -1607,6 +1781,113 @@ static inline f16_lohi f16_pack2(fcv t0, fcv t1){
         _mm512_maskz_set1_epi64(_mm512_cmplt_epu64_mask(r.lo, elo), 1)));
     return r;
 }
+static inline f16_lohi f16_pack2(fcv t0, fcv t1){
+    return f16_pack2i(f16_mround(t0.re), f16_mround(t0.im),
+                      f16_mround(t1.re), f16_mround(t1.im));
+}
+/* signed magic-bias round (no clip): |x| < 2^51 */
+static inline __m512i f16_mround_s(__m512d x){
+    const __m512i bias = _mm512_set1_epi64(0x4338000000000000LL);
+    return _mm512_sub_epi64(
+        _mm512_castpd_si512(_mm512_add_pd(x, _mm512_castsi512_pd(bias))), bias);
+}
+
+/* ------------------------------------------------------------------ */
+/* centered codec support. Digits are pre-centered in the pad copy as */
+/* (i16)(d ^ 0x8000) = d - 2^15 (pad tail stays zero = no contribution)*/
+/* and the product is recovered from the signed coefficients via       */
+/*   c_k = c^_k + (S_k << 15) - (C_k << 30)                            */
+/* with S the running window digit sum (reference int_fft formula) and */
+/* C the closed-form window overlap length.                            */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    const uint16_t* a; const uint16_t* b;
+    int64_t na, nb;             /* digit counts (4 * limbs) */
+    int xored;                  /* streams are xor-centered: un-xor on load */
+} f16_cctx;
+
+/* 16 digits at offset k (may be negative / past the end): fault-suppressed
+ * masked load, invalid lanes zero */
+static inline __m512i f16_dig16(const uint16_t* d, int64_t ndig, int64_t k,
+                                int xored){
+    uint32_t lo = k < 0 ? (uint32_t)(-k > 16 ? 16 : -k) : 0;
+    int64_t rem = ndig - k;
+    uint32_t hi = rem >= 16 ? 0u : (rem <= 0 ? 16u : (uint32_t)(16 - rem));
+    __mmask16 m = (__mmask16)((0xFFFFu << lo) & (0xFFFFu >> hi));
+    __m256i v = _mm256_maskz_loadu_epi16(m, d + k);
+    if(xored)
+        v = _mm256_maskz_mov_epi16(m,
+            _mm256_xor_si256(v, _mm256_set1_epi16((short)0x8000)));
+    return _mm512_cvtepu16_epi32(v);
+}
+static inline __m512i f16_prefix16_i32(__m512i x){
+    const __m512i z = _mm512_setzero_si512();
+    x = _mm512_add_epi32(x, _mm512_alignr_epi32(x, z, 15));
+    x = _mm512_add_epi32(x, _mm512_alignr_epi32(x, z, 14));
+    x = _mm512_add_epi32(x, _mm512_alignr_epi32(x, z, 12));
+    x = _mm512_add_epi32(x, _mm512_alignr_epi32(x, z, 8));
+    return x;
+}
+/* corrections for the 16-digit window [k, k+16): even-digit lanes -> *ce,
+ * odd -> *co (matching the tile's re/im coefficient lanes). *Sbase is the
+ * running sum of dS over digits < k, updated to < k+16. */
+static inline void f16_centered_corr(__m512i* ce, __m512i* co,
+                                     const f16_cctx* cx, int64_t k,
+                                     int64_t* Sbase){
+    __m512i af = f16_dig16(cx->a, cx->na, k, cx->xored);
+    __m512i bf = f16_dig16(cx->b, cx->nb, k, cx->xored);
+    __m512i al = f16_dig16(cx->a, cx->na, k - cx->nb, cx->xored);
+    __m512i bl = f16_dig16(cx->b, cx->nb, k - cx->na, cx->xored);
+    __m512i dS = _mm512_sub_epi32(_mm512_add_epi32(af, bf),
+                                  _mm512_add_epi32(al, bl));
+    __m512i pS = f16_prefix16_i32(dS);
+    const __m512i IE = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i IO = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m512i base = _mm512_set1_epi64(*Sbase);
+    __m512i Se = _mm512_add_epi64(base, _mm512_cvtepi32_epi64(
+        _mm512_castsi512_si256(_mm512_permutexvar_epi32(IE, pS))));
+    __m512i So = _mm512_add_epi64(base, _mm512_cvtepi32_epi64(
+        _mm512_castsi512_si256(_mm512_permutexvar_epi32(IO, pS))));
+    __m128i top = _mm512_extracti32x4_epi32(pS, 3);
+    *Sbase += (int32_t)_mm_extract_epi32(top, 3);
+    /* C(j) = min(j+1, na) - clamp(j+1-nb, 0, na), j = digit index */
+    const __m512i lane2 = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+    __m512i j1e = _mm512_add_epi64(_mm512_set1_epi64(k), lane2);  /* j+1 even */
+    __m512i j1o = _mm512_add_epi64(j1e, _mm512_set1_epi64(1));
+    __m512i nav = _mm512_set1_epi64(cx->na), nbv = _mm512_set1_epi64(cx->nb);
+    __m512i z = _mm512_setzero_si512();
+    __m512i Ce = _mm512_sub_epi64(_mm512_min_epi64(j1e, nav),
+        _mm512_min_epi64(_mm512_max_epi64(_mm512_sub_epi64(j1e, nbv), z), nav));
+    __m512i Co = _mm512_sub_epi64(_mm512_min_epi64(j1o, nav),
+        _mm512_min_epi64(_mm512_max_epi64(_mm512_sub_epi64(j1o, nbv), z), nav));
+    *ce = _mm512_sub_epi64(_mm512_slli_epi64(Se, 15), _mm512_slli_epi64(Ce, 30));
+    *co = _mm512_sub_epi64(_mm512_slli_epi64(So, 15), _mm512_slli_epi64(Co, 30));
+}
+/* sum of digits j with 0 <= j < min(t, ndig) (front checkpoint helper) */
+static inline int64_t f16_digsum(const uint16_t* d, int64_t ndig, int64_t t,
+                                 int xored){
+    if(t > ndig) t = ndig;
+    if(t <= 0) return 0;
+    const __m256i X = _mm256_set1_epi16((short)0x8000);
+    int64_t s = 0, i = 0;
+    __m512i acc = _mm512_setzero_si512();
+    for(; i + 32 <= t; i += 32){
+        __m256i a = _mm256_loadu_si256((const __m256i*)(d + i));
+        __m256i b = _mm256_loadu_si256((const __m256i*)(d + i + 16));
+        if(xored){ a = _mm256_xor_si256(a, X); b = _mm256_xor_si256(b, X); }
+        acc = _mm512_add_epi32(acc, _mm512_add_epi32(
+            _mm512_cvtepu16_epi32(a), _mm512_cvtepu16_epi32(b)));
+        if((i & 8191) == 8160){ s += _mm512_reduce_add_epi32(acc); acc = _mm512_setzero_si512(); }
+    }
+    s += _mm512_reduce_add_epi32(acc);
+    for(; i < t; ++i) s += (uint16_t)(xored ? d[i] ^ 0x8000 : d[i]);
+    return s;
+}
+static inline int64_t f16_sbase(const f16_cctx* cx, int64_t k0){
+    int x = cx->xored;
+    return f16_digsum(cx->a, cx->na, k0, x) - f16_digsum(cx->a, cx->na, k0 - cx->nb, x)
+         + f16_digsum(cx->b, cx->nb, k0, x) - f16_digsum(cx->b, cx->nb, k0 - cx->na, x);
+}
 typedef struct { __m512i prev_hi; unsigned cin; } f16_chain;
 static inline __m512i f16_chain_step(f16_chain* c, f16_lohi p){
     __m512i his = _mm512_alignr_epi64(p.hi, c->prev_hi, 7);
@@ -1622,9 +1903,11 @@ static inline __m512i f16_chain_step(f16_chain* c, f16_lohi p){
 }
 
 /* rp gets n/2 limbs; returns 1 if the final carry-out is zero */
-static inline int f16_inv_final_emit(uint64_t* rp, double* data, uint32_t n,
-                                     const f16_plan* pl){
+static inline int f16_inv_final_emit(uint64_t* rp, int64_t rl, double* data,
+                                     uint32_t n, const f16_plan* pl){
     const size_t limbs_q = n / 8u;                   /* limbs per quarter */
+    int64_t rem[4];
+    for(int f = 0; f < 4; ++f) rem[f] = rl - (int64_t)((size_t)f * limbs_q);
     f16_chain ch[4];
     for(int f = 0; f < 4; ++f){ ch[f].prev_hi = _mm512_setzero_si512(); ch[f].cin = 0; }
     double* p0 = data;
@@ -1636,10 +1919,14 @@ static inline int f16_inv_final_emit(uint64_t* rp, double* data, uint32_t n,
     uint64_t* r2 = rp + 2u * limbs_q;
     uint64_t* r3 = rp + 3u * limbs_q;
     const double* twp = pl->tw22[__builtin_ctz(n)];
+    const int twc = __builtin_ctz(n) >= F16_TWC_MIN_LG;
+    const fcv c8 = f16_tw_c8(n);
     for(uint32_t t = 0; t < n / 64u; ++t){
         fcv o0[2], o1[2], o2[2], o3[2];
+        fcv w1a, w2a, w1b, w2b;
+        f16_tw22_get(twp, twc, c8, &w1a, &w2a, &w1b, &w2b);
         for(int u = 0; u < 2; ++u){
-            fcv w1 = f_load(twp + 32 * u), w2 = f_load(twp + 32 * u + 16);
+            fcv w1 = u ? w1b : w1a, w2 = u ? w2b : w2a;
             fcv y0 = f_load(p0 + 16 * u), y1 = f_load(p1 + 16 * u);
             fcv y2 = f_load(p2 + 16 * u), y3 = f_load(p3 + 16 * u);
             fcv s  = f_mulc(y1, w2);
@@ -1651,22 +1938,28 @@ static inline int f16_inv_final_emit(uint64_t* rp, double* data, uint32_t n,
             s = f_mulc(b3, f_j(w1));
             o1[u] = f_add(b1, s); o3[u] = f_sub(b1, s);
         }
-        twp += 64;
+        twp += twc ? 32 : 64;
         p0 += 32; p1 += 32; p2 += 32; p3 += 32;
         f16_lohi q;
-        q = f16_pack2(o0[0], o0[1]); _mm512_storeu_si512((void*)r0, f16_chain_step(&ch[0], q));
-        q = f16_pack2(o1[0], o1[1]); _mm512_storeu_si512((void*)r1, f16_chain_step(&ch[1], q));
-        q = f16_pack2(o2[0], o2[1]); _mm512_storeu_si512((void*)r2, f16_chain_step(&ch[2], q));
-        q = f16_pack2(o3[0], o3[1]); _mm512_storeu_si512((void*)r3, f16_chain_step(&ch[3], q));
+        q = f16_pack2(o0[0], o0[1]);
+        _mm512_mask_storeu_epi64((void*)r0, f16_st_mask(rem[0]), f16_chain_step(&ch[0], q));
+        q = f16_pack2(o1[0], o1[1]);
+        _mm512_mask_storeu_epi64((void*)r1, f16_st_mask(rem[1]), f16_chain_step(&ch[1], q));
+        q = f16_pack2(o2[0], o2[1]);
+        _mm512_mask_storeu_epi64((void*)r2, f16_st_mask(rem[2]), f16_chain_step(&ch[2], q));
+        q = f16_pack2(o3[0], o3[1]);
+        _mm512_mask_storeu_epi64((void*)r3, f16_st_mask(rem[3]), f16_chain_step(&ch[3], q));
         r0 += 8; r1 += 8; r2 += 8; r3 += 8;
+        rem[0] -= 8; rem[1] -= 8; rem[2] -= 8; rem[3] -= 8;
     }
     /* junction fixups: front f's trailing (hi lane 7 + cout) -> front f+1 */
     for(int f = 0; f < 3; ++f){
         uint64_t hi7;
         memcpy(&hi7, (const char*)&ch[f].prev_hi + 56, 8);
         unsigned __int128 c = (unsigned __int128)hi7 + ch[f].cin;
+        if((size_t)(f + 1) * limbs_q >= (size_t)rl){ if(c) return 0; continue; }
         uint64_t* q = rp + (size_t)(f + 1) * limbs_q;
-        uint64_t* qe = rp + n / 2u;
+        uint64_t* qe = rp + rl;
         while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
         if(c) return 0;
     }
@@ -1678,6 +1971,189 @@ static inline int f16_inv_final_emit(uint64_t* rp, double* data, uint32_t n,
     return 1;
 }
 
+/* centered variant of the final emit: signed rounding, per-coefficient
+ * correction c = c^ + (S<<15) - (C<<30), then the usual pack + chains.
+ * Front f covers digits [f*n/2, (f+1)*n/2); S checkpoints via f16_sbase. */
+static inline int f16_inv_final_emit_c(uint64_t* rp, int64_t rl, double* data,
+                                       uint32_t n,
+                                       const f16_plan* pl, const f16_cctx* cx){
+    const size_t limbs_q = n / 8u;
+    f16_chain ch[4];
+    int64_t S[4]; int64_t kd[4]; int64_t rem[4];
+    for(int f = 0; f < 4; ++f){
+        ch[f].prev_hi = _mm512_setzero_si512(); ch[f].cin = 0;
+        kd[f] = (int64_t)f * (int64_t)(n / 2u);
+        S[f]  = f16_sbase(cx, kd[f]);
+        rem[f] = rl - (int64_t)((size_t)f * limbs_q);
+    }
+    double* p0 = data;
+    double* p1 = data + 2u * (size_t)(n / 4u);
+    double* p2 = data + 4u * (size_t)(n / 4u);
+    double* p3 = data + 6u * (size_t)(n / 4u);
+    uint64_t* r0 = rp;
+    uint64_t* r1 = rp + limbs_q;
+    uint64_t* r2 = rp + 2u * limbs_q;
+    uint64_t* r3 = rp + 3u * limbs_q;
+    const double* twp = pl->tw22[__builtin_ctz(n)];
+    const int twc2 = __builtin_ctz(n) >= F16_TWC_MIN_LG;
+    const fcv c82 = f16_tw_c8(n);
+    for(uint32_t t = 0; t < n / 64u; ++t){
+        fcv o0[2], o1[2], o2[2], o3[2];
+        fcv w1A, w2A, w1B2, w2B2;
+        f16_tw22_get(twp, twc2, c82, &w1A, &w2A, &w1B2, &w2B2);
+        for(int u = 0; u < 2; ++u){
+            fcv w1 = u ? w1B2 : w1A, w2 = u ? w2B2 : w2A;
+            fcv y0 = f_load(p0 + 16 * u), y1 = f_load(p1 + 16 * u);
+            fcv y2 = f_load(p2 + 16 * u), y3 = f_load(p3 + 16 * u);
+            fcv s  = f_mulc(y1, w2);
+            fcv b0 = f_add(y0, s), b1 = f_sub(y0, s);
+            s      = f_mulc(y3, w2);
+            fcv b2 = f_add(y2, s), b3 = f_sub(y2, s);
+            s = f_mulc(b2, w1);
+            o0[u] = f_add(b0, s); o2[u] = f_sub(b0, s);
+            s = f_mulc(b3, f_j(w1));
+            o1[u] = f_add(b1, s); o3[u] = f_sub(b1, s);
+        }
+        twp += twc2 ? 32 : 64;
+        p0 += 32; p1 += 32; p2 += 32; p3 += 32;
+        fcv* os[4] = { o0, o1, o2, o3 };
+        uint64_t* rr[4] = { r0, r1, r2, r3 };
+        for(int f = 0; f < 4; ++f){
+            __m512i e0, c0, e1, c1;
+            f16_centered_corr(&e0, &c0, cx, kd[f], &S[f]);
+            f16_centered_corr(&e1, &c1, cx, kd[f] + 16, &S[f]);
+            kd[f] += 32;
+            __m512i re0 = _mm512_add_epi64(f16_mround_s(os[f][0].re), e0);
+            __m512i im0 = _mm512_add_epi64(f16_mround_s(os[f][0].im), c0);
+            __m512i re1 = _mm512_add_epi64(f16_mround_s(os[f][1].re), e1);
+            __m512i im1 = _mm512_add_epi64(f16_mround_s(os[f][1].im), c1);
+            f16_lohi q = f16_pack2i(re0, im0, re1, im1);
+            _mm512_mask_storeu_epi64((void*)rr[f], f16_st_mask(rem[f]),
+                                     f16_chain_step(&ch[f], q));
+            rem[f] -= 8;
+        }
+        r0 += 8; r1 += 8; r2 += 8; r3 += 8;
+    }
+    for(int f = 0; f < 3; ++f){
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[f].prev_hi + 56, 8);
+        unsigned __int128 c = (unsigned __int128)hi7 + ch[f].cin;
+        if((size_t)(f + 1) * limbs_q >= (size_t)rl){ if(c) return 0; continue; }
+        uint64_t* q = rp + (size_t)(f + 1) * limbs_q;
+        uint64_t* qe = rp + rl;
+        while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
+        if(c) return 0;
+    }
+    {
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[3].prev_hi + 56, 8);
+        if(hi7 + ch[3].cin != 0) return 0;
+    }
+    return 1;
+}
+
+/* segmented corrections: per 16-digit window entirely inside one validity
+ * segment, half the digit loads and a linear C replace the generic path.
+ *   S1 [0, nb):       dS = a_f + b_f         C = k+1        (rising)
+ *   S2 [nb, na):      dS = a_f - a_lag       C = nb         (constant)
+ *   S3 [na, na+nb):   dS = -(a_lag + b_lag)  C = na+nb-1-k  (falling)
+ *   beyond na+nb: dS, S, C, corr all zero -- the emit stops there.
+ * Boundary-straddling windows fall back to f16_centered_corr. */
+static inline void f16_corr_seg(__m512i* ce, __m512i* co, const f16_cctx* cx,
+                                int64_t k, int64_t* S, int seg){
+    const __m256i X = _mm256_set1_epi16((short)0x8000);
+    __m512i dS;
+    if(seg == 1){
+        __m256i a = _mm256_loadu_si256((const __m256i*)(cx->a + k));
+        __m256i b = _mm256_loadu_si256((const __m256i*)(cx->b + k));
+        if(cx->xored){ a = _mm256_xor_si256(a, X); b = _mm256_xor_si256(b, X); }
+        dS = _mm512_add_epi32(_mm512_cvtepu16_epi32(a), _mm512_cvtepu16_epi32(b));
+    }else if(seg == 2){
+        /* middle segment: only the LONGER operand's forward+lag are live */
+        const uint16_t* f; const uint16_t* l2;
+        if(cx->na >= cx->nb){ f = cx->a + k; l2 = cx->a + k - cx->nb; }
+        else                { f = cx->b + k; l2 = cx->b + k - cx->na; }
+        __m256i a = _mm256_loadu_si256((const __m256i*)f);
+        __m256i l = _mm256_loadu_si256((const __m256i*)l2);
+        if(cx->xored){ a = _mm256_xor_si256(a, X); l = _mm256_xor_si256(l, X); }
+        dS = _mm512_sub_epi32(_mm512_cvtepu16_epi32(a), _mm512_cvtepu16_epi32(l));
+    }else{
+        __m256i l = _mm256_loadu_si256((const __m256i*)(cx->a + k - cx->nb));
+        __m256i m = _mm256_loadu_si256((const __m256i*)(cx->b + k - cx->na));
+        if(cx->xored){ l = _mm256_xor_si256(l, X); m = _mm256_xor_si256(m, X); }
+        dS = _mm512_sub_epi32(_mm512_setzero_si512(),
+            _mm512_add_epi32(_mm512_cvtepu16_epi32(l), _mm512_cvtepu16_epi32(m)));
+    }
+    __m512i pS = f16_prefix16_i32(dS);
+    const __m512i IE = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i IO = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m512i base = _mm512_set1_epi64(*S);
+    __m512i Se = _mm512_add_epi64(base, _mm512_cvtepi32_epi64(
+        _mm512_castsi512_si256(_mm512_permutexvar_epi32(IE, pS))));
+    __m512i So = _mm512_add_epi64(base, _mm512_cvtepi32_epi64(
+        _mm512_castsi512_si256(_mm512_permutexvar_epi32(IO, pS))));
+    __m128i top = _mm512_extracti32x4_epi32(pS, 3);
+    *S += (int32_t)_mm_extract_epi32(top, 3);
+    __m512i Ce, Co;
+    const __m512i lane2 = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    if(seg == 1){
+        __m512i je = _mm512_add_epi64(_mm512_set1_epi64(k + 1), lane2);
+        Ce = je; Co = _mm512_add_epi64(je, _mm512_set1_epi64(1));
+    }else if(seg == 2){
+        Ce = Co = _mm512_set1_epi64(cx->na <= cx->nb ? cx->na : cx->nb);
+    }else{
+        __m512i je = _mm512_sub_epi64(_mm512_set1_epi64(cx->na + cx->nb - 1 - k), lane2);
+        Ce = je; Co = _mm512_sub_epi64(je, _mm512_set1_epi64(1));
+    }
+    *ce = _mm512_sub_epi64(_mm512_slli_epi64(Se, 15), _mm512_slli_epi64(Ce, 30));
+    *co = _mm512_sub_epi64(_mm512_slli_epi64(So, 15), _mm512_slli_epi64(Co, 30));
+}
+static inline void f16_corr_auto(__m512i* ce, __m512i* co, const f16_cctx* cx,
+                                 int64_t k, int64_t* S){
+    int64_t k2 = k + 16;
+    int64_t lo = cx->nb <= cx->na ? cx->nb : cx->na;
+    int64_t hi = cx->nb <= cx->na ? cx->na : cx->nb;
+    if(k2 <= lo)                          f16_corr_seg(ce, co, cx, k, S, 1);
+    else if(k >= lo && k2 <= hi)          f16_corr_seg(ce, co, cx, k, S, 2);
+    else if(k >= hi && k2 <= cx->na + cx->nb)
+                                          f16_corr_seg(ce, co, cx, k, S, 3);
+    else                                  f16_centered_corr(ce, co, cx, k, S);
+}
+
+/* flat centered emit: data is already fully inverse-transformed into
+ * natural order (the final r22 ran as a separate mem pass). One sequential
+ * spectrum stream + 4 digit streams + 1 write stream + a single carry
+ * chain: prefetch-friendly at sizes where the fused emit's ~25 concurrent
+ * streams (4 fronts x 4 digit streams + quarters + twiddles) go
+ * latency-bound. */
+static inline int f16_emit_c_flat(uint64_t* rp, int64_t rl, const double* data,
+                                  uint32_t n, const f16_cctx* cx){
+    f16_chain ch; ch.prev_hi = _mm512_setzero_si512(); ch.cin = 0;
+    int64_t S = 0, kd = 0, rem = rl;
+    /* coefficients beyond na+nb digits are exactly zero: stop there */
+    const uint32_t tend = (uint32_t)(((uint64_t)(cx->na + cx->nb) + 31) / 32);
+    const uint32_t tlim = tend < n / 16u ? tend : n / 16u;
+    for(uint32_t t = 0; t < tlim; ++t){
+        fcv o0 = f_load(data + 32u * (size_t)t);
+        fcv o1 = f_load(data + 32u * (size_t)t + 16u);
+        __m512i e0, c0, e1, c1;
+        f16_corr_auto(&e0, &c0, cx, kd, &S);
+        f16_corr_auto(&e1, &c1, cx, kd + 16, &S);
+        kd += 32;
+        f16_lohi q = f16_pack2i(
+            _mm512_add_epi64(f16_mround_s(o0.re), e0),
+            _mm512_add_epi64(f16_mround_s(o0.im), c0),
+            _mm512_add_epi64(f16_mround_s(o1.re), e1),
+            _mm512_add_epi64(f16_mround_s(o1.im), c1));
+        _mm512_mask_storeu_epi64((void*)rp, f16_st_mask(rem),
+                                 f16_chain_step(&ch, q));
+        rp += 8; rem -= 8;
+    }
+    uint64_t hi7;
+    memcpy(&hi7, (const char*)&ch.prev_hi + 56, 8);
+    return hi7 + ch.cin == 0;
+}
+
 /* PFA inverse output stage fused with the emit: reads M branch streams
  * (each branch already fully inverse-transformed), applies the inverse
  * radix-M butterfly per tile, lane-shuffles into M natural-order region
@@ -1685,16 +2161,19 @@ static inline int f16_inv_final_emit(uint64_t* rp, double* data, uint32_t n,
  * region with its own SWAR carry chain. Region b's tile at step t takes
  * butterfly output y[(b*n + 8t) mod M] lane-shuffled by residue masks. */
 __attribute__((always_inline))
-static inline int f16_pfa_emit_impl(uint64_t* rp, double* data, uint32_t n,
+static inline int f16_pfa_emit_impl(uint64_t* rp, int64_t rl, double* data,
+                                    uint32_t n,
                                     uint32_t M, const f16_plan* pl){
     (void)pl;
     uint8_t km[8]; f16_kmasks(km, M);
     const double* br[7]; uint64_t* r[7]; uint32_t phi[7];
+    int64_t rme[7];
     f16_chain ch[7];
     const size_t limbs_b = (size_t)n / 2u;
     for(uint32_t b = 0; b < M; ++b){
         br[b]  = data + 2u * (size_t)n * b;
         r[b]   = rp + (size_t)b * limbs_b;
+        rme[b] = rl - (int64_t)((size_t)b * limbs_b);
         phi[b] = (uint32_t)(((uint64_t)b * n) % M);
         ch[b].prev_hi = _mm512_setzero_si512();
         ch[b].cin = 0;
@@ -1725,8 +2204,9 @@ static inline int f16_pfa_emit_impl(uint64_t* rp, double* data, uint32_t n,
         for(uint32_t b = 0; b < M; ++b){
             f16_lohi q = f16_pack2(f_load(stage + 32u * b),
                                    f_load(stage + 32u * b + 16u));
-            _mm512_storeu_si512((void*)r[b], f16_chain_step(&ch[b], q));
-            r[b] += 8;
+            _mm512_mask_storeu_epi64((void*)r[b], f16_st_mask(rme[b]),
+                                     f16_chain_step(&ch[b], q));
+            r[b] += 8; rme[b] -= 8;
             phi[b] = (phi[b] + 16u) % M;
         }
     }
@@ -1735,8 +2215,9 @@ static inline int f16_pfa_emit_impl(uint64_t* rp, double* data, uint32_t n,
         uint64_t hi7;
         memcpy(&hi7, (const char*)&ch[b].prev_hi + 56, 8);
         unsigned __int128 c = (unsigned __int128)hi7 + ch[b].cin;
+        if((size_t)(b + 1u) * limbs_b >= (size_t)rl){ if(c) return 0; continue; }
         uint64_t* q = rp + (size_t)(b + 1u) * limbs_b;
-        uint64_t* qe = rp + (size_t)M * limbs_b;
+        uint64_t* qe = rp + rl;
         while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
         if(c) return 0;
     }
@@ -1750,16 +2231,19 @@ static inline int f16_pfa_emit_impl(uint64_t* rp, double* data, uint32_t n,
 /* twiddle-fixup emit for M >= 5: pre-rotate by conj(w^{b l}), inverse-DFT
  * over relabeled branches; the region output is then a pure index relabel. */
 __attribute__((always_inline))
-static inline int f16_pfa_emit_tw(uint64_t* rp, double* data, uint32_t n,
+static inline int f16_pfa_emit_tw(uint64_t* rp, int64_t rl, double* data,
+                                  uint32_t n,
                                   uint32_t M, const double* wt,
                                   const f16_plan* pl){
     (void)pl;
     const double* br[7]; uint64_t* r[7]; uint32_t phi[7];
+    int64_t rme[7];
     f16_chain ch[7];
     const size_t limbs_b = (size_t)n / 2u;
     for(uint32_t b = 0; b < M; ++b){
         br[b]  = data + 2u * (size_t)n * b;
         r[b]   = rp + (size_t)b * limbs_b;
+        rme[b] = rl - (int64_t)((size_t)b * limbs_b);
         phi[b] = (uint32_t)(((uint64_t)b * n) % M);
         ch[b].prev_hi = _mm512_setzero_si512();
         ch[b].cin = 0;
@@ -1791,8 +2275,9 @@ static inline int f16_pfa_emit_tw(uint64_t* rp, double* data, uint32_t n,
         for(uint32_t b = 0; b < M; ++b){
             f16_lohi q = f16_pack2(f_load(stage + 32u * b),
                                    f_load(stage + 32u * b + 16u));
-            _mm512_storeu_si512((void*)r[b], f16_chain_step(&ch[b], q));
-            r[b] += 8;
+            _mm512_mask_storeu_epi64((void*)r[b], f16_st_mask(rme[b]),
+                                     f16_chain_step(&ch[b], q));
+            r[b] += 8; rme[b] -= 8;
         }
         uint32_t tmp[7];
         for(uint32_t j = 0; j < M; ++j) tmp[(j + sh16) % M] = rg[j];
@@ -1802,8 +2287,9 @@ static inline int f16_pfa_emit_tw(uint64_t* rp, double* data, uint32_t n,
         uint64_t hi7;
         memcpy(&hi7, (const char*)&ch[b].prev_hi + 56, 8);
         unsigned __int128 c = (unsigned __int128)hi7 + ch[b].cin;
+        if((size_t)(b + 1u) * limbs_b >= (size_t)rl){ if(c) return 0; continue; }
         uint64_t* q = rp + (size_t)(b + 1u) * limbs_b;
-        uint64_t* qe = rp + (size_t)M * limbs_b;
+        uint64_t* qe = rp + rl;
         while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
         if(c) return 0;
     }
@@ -1820,17 +2306,20 @@ static inline int f16_pfa_emit_tw(uint64_t* rp, double* data, uint32_t n,
  * per-step relabel is pure GPR/SSA renaming. Region b's chain finishes in
  * slot ((b+1)*n) mod M (phi advances by n over the whole pass). */
 __attribute__((always_inline))
-static inline int f16_pfa_emit_rot(uint64_t* rp, double* data, uint32_t n,
+static inline int f16_pfa_emit_rot(uint64_t* rp, int64_t rl, double* data,
+                                   uint32_t n,
                                    uint32_t M, const double* wt,
                                    const f16_plan* pl){
     (void)pl;
     const double* br[7]; uint64_t* rph[7];
+    int64_t rme[7];
     f16_chain ch[7];
     const size_t limbs_b = (size_t)n / 2u;
     for(uint32_t b = 0; b < M; ++b){
         br[b] = data + 2u * (size_t)n * b;
         uint32_t ph = (uint32_t)(((uint64_t)b * n) % M);
         rph[ph] = rp + (size_t)b * limbs_b;
+        rme[ph] = rl - (int64_t)((size_t)b * limbs_b);
         ch[ph].prev_hi = _mm512_setzero_si512();
         ch[ph].cin = 0;
     }
@@ -1858,20 +2347,22 @@ static inline int f16_pfa_emit_rot(uint64_t* rp, double* data, uint32_t n,
         }
         for(uint32_t j = 0; j < M; ++j){
             f16_lohi q = f16_pack2(y0[j], y1[(j + sh8) % M]);
-            _mm512_storeu_si512((void*)rph[j], f16_chain_step(&ch[j], q));
-            rph[j] += 8;
+            _mm512_mask_storeu_epi64((void*)rph[j], f16_st_mask(rme[j]),
+                                     f16_chain_step(&ch[j], q));
+            rph[j] += 8; rme[j] -= 8;
         }
-        uint64_t* tp[7]; f16_chain tc[7];
-        for(uint32_t j = 0; j < M; ++j){ tp[(j + sh16) % M] = rph[j]; tc[(j + sh16) % M] = ch[j]; }
-        for(uint32_t j = 0; j < M; ++j){ rph[j] = tp[j]; ch[j] = tc[j]; }
+        uint64_t* tp[7]; f16_chain tc[7]; int64_t tr2[7];
+        for(uint32_t j = 0; j < M; ++j){ tp[(j + sh16) % M] = rph[j]; tc[(j + sh16) % M] = ch[j]; tr2[(j + sh16) % M] = rme[j]; }
+        for(uint32_t j = 0; j < M; ++j){ rph[j] = tp[j]; ch[j] = tc[j]; rme[j] = tr2[j]; }
     }
     for(uint32_t b = 0; b + 1u < M; ++b){
         uint32_t sl = (uint32_t)(((uint64_t)(b + 1u) * n) % M);
         uint64_t hi7;
         memcpy(&hi7, (const char*)&ch[sl].prev_hi + 56, 8);
         unsigned __int128 c = (unsigned __int128)hi7 + ch[sl].cin;
+        if((size_t)(b + 1u) * limbs_b >= (size_t)rl){ if(c) return 0; continue; }
         uint64_t* q = rp + (size_t)(b + 1u) * limbs_b;
-        uint64_t* qe = rp + (size_t)M * limbs_b;
+        uint64_t* qe = rp + rl;
         while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
         if(c) return 0;
     }
@@ -1896,11 +2387,13 @@ static inline int f16_pfa_emit_rot(uint64_t* rp, double* data, uint32_t n,
  * w1 twiddles) + inverse radix-3, and writes 6 natural fronts (low/high
  * half of each region), one carry chain each. Mirrors f16_pfa3x2_input;
  * the mem_ir22 sweep is gone. */
-static inline int f16_pfa3x2_emit(uint64_t* rp, double* data, uint32_t n,
+static inline int f16_pfa3x2_emit(uint64_t* rp, int64_t rl, double* data,
+                                  uint32_t n,
                                   const f16_plan* pl){
     uint8_t km[8]; f16_kmasks(km, 3u);
     const double* pe[3]; const double* po[3];
     uint64_t* rf[6];
+    int64_t rme6[6];
     uint32_t fres[6];
     f16_chain ch[6];
     const size_t limbs_q = (size_t)n / 4u;       /* limbs per front */
@@ -1909,10 +2402,14 @@ static inline int f16_pfa3x2_emit(uint64_t* rp, double* data, uint32_t n,
         po[b] = pe[b] + n;
         rf[2 * b]     = rp + (size_t)b * (n / 2u);
         rf[2 * b + 1] = rf[2 * b] + limbs_q;
+        rme6[2 * b]     = rl - (int64_t)((size_t)b * (n / 2u));
+        rme6[2 * b + 1] = rme6[2 * b] - (int64_t)limbs_q;
         fres[2 * b]     = (uint32_t)(((uint64_t)b * n) % 3u);
         fres[2 * b + 1] = (uint32_t)(((uint64_t)b * n + n / 2u) % 3u);
     }
     for(int f = 0; f < 6; ++f){ ch[f].prev_hi = _mm512_setzero_si512(); ch[f].cin = 0; }
+    const int twc3e = __builtin_ctz(n) >= F16_TWC_MIN_LG;
+    const fcv c83e = f16_tw_c8(n);
     const double* tw = pl->tw22[__builtin_ctz(n)];
     _Alignas(64) double stage[6 * 2 * 16];
     for(uint32_t i = 0; i < n / 32u; ++i){
@@ -1920,8 +2417,10 @@ static inline int f16_pfa3x2_emit(uint64_t* rp, double* data, uint32_t n,
         const int ph2 = i >= n / 64u;
         for(int sub = 0; sub < 2; ++sub){
             fcv xlo[3], xhi[3], ylo[3], yhi[3];
-            fcv w; w.re = _mm512_load_pd(tw + 32 * sub);
-                   w.im = _mm512_load_pd(tw + 32 * sub + 8);
+            fcv w; w.re = _mm512_load_pd(tw);
+                   w.im = _mm512_load_pd(tw + 8);
+            if(sub){ w.re = _mm512_load_pd(tw + (twc3e ? 16 : 32));
+                     w.im = _mm512_load_pd(tw + (twc3e ? 24 : 40)); }
             if(ph2) w = f_j(w);
             for(uint32_t b = 0; b < 3; ++b){
                 fcv ee = f_load(pe[b]); pe[b] += 16;
@@ -1954,19 +2453,21 @@ static inline int f16_pfa3x2_emit(uint64_t* rp, double* data, uint32_t n,
         for(int f = 0; f < 6; ++f){
             f16_lohi q = f16_pack2(f_load(stage + 32u * (uint32_t)f),
                                    f_load(stage + 32u * (uint32_t)f + 16u));
-            _mm512_storeu_si512((void*)rf[f], f16_chain_step(&ch[f], q));
-            rf[f] += 8;
+            _mm512_mask_storeu_epi64((void*)rf[f], f16_st_mask(rme6[f]),
+                                     f16_chain_step(&ch[f], q));
+            rf[f] += 8; rme6[f] -= 8;
             fres[f] = (fres[f] + 16u) % 3u;
         }
-        tw += 64;
+        tw += twc3e ? 32 : 64;
     }
     /* fronts are contiguous in rp order; junction f -> f+1, top must vanish */
     for(int f = 0; f + 1 < 6; ++f){
         uint64_t hi7;
         memcpy(&hi7, (const char*)&ch[f].prev_hi + 56, 8);
         unsigned __int128 c = (unsigned __int128)hi7 + ch[f].cin;
+        if((size_t)(f + 1) * limbs_q >= (size_t)rl){ if(c) return 0; continue; }
         uint64_t* q = rp + (size_t)(f + 1) * limbs_q;
-        uint64_t* qe = rp + 6u * limbs_q;
+        uint64_t* qe = rp + rl;
         while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
         if(c) return 0;
     }
@@ -1978,17 +2479,150 @@ static inline int f16_pfa3x2_emit(uint64_t* rp, double* data, uint32_t n,
     return 1;
 }
 
-static inline int f16_pfa_emit(uint64_t* rp, double* data, uint32_t n,
+/* centered PFA emit (merge shuffle for all M + per-region corrections).
+ * Region b covers digits [b*2n, (b+1)*2n). */
+__attribute__((always_inline))
+static inline int f16_pfa_emit_c_impl(uint64_t* rp, int64_t rl, double* data,
+                                      uint32_t n,
+                                      uint32_t M, const f16_plan* pl,
+                                      const f16_cctx* cx){
+    (void)pl;
+    uint8_t km[8]; f16_kmasks(km, M);
+    const double* br[7]; uint64_t* r[7]; uint32_t phi[7];
+    int64_t rme[7];
+    f16_chain ch[7];
+    int64_t S[7], kd[7];
+    const size_t limbs_b = (size_t)n / 2u;
+    for(uint32_t b = 0; b < M; ++b){
+        br[b]  = data + 2u * (size_t)n * b;
+        r[b]   = rp + (size_t)b * limbs_b;
+        rme[b] = rl - (int64_t)((size_t)b * limbs_b);
+        phi[b] = (uint32_t)(((uint64_t)b * n) % M);
+        ch[b].prev_hi = _mm512_setzero_si512();
+        ch[b].cin = 0;
+        kd[b] = (int64_t)b * (int64_t)(2u * n);
+        S[b]  = f16_sbase(cx, kd[b]);
+    }
+    _Alignas(64) double stage[7 * 2 * 16];
+    for(uint32_t t = 0; t < n / 8u; t += 2){
+        for(int u = 0; u < 2; ++u){
+            fcv x[7], y[7];
+            for(uint32_t b = 0; b < M; ++b){
+                x[b] = f_load(br[b]);
+                br[b] += 16;
+            }
+            f16_pfa_bfly(x, y, M, 1);
+            for(uint32_t b = 0; b < M; ++b){
+                uint32_t ph = (phi[b] + (uint32_t)(8 * u)) % M;
+                fcv o = y[0];
+                for(uint32_t j = 0; j < M; ++j){
+                    uint32_t d = (j + M - ph) % M;
+                    o.re = _mm512_mask_mov_pd(o.re, km[d], y[j].re);
+                    o.im = _mm512_mask_mov_pd(o.im, km[d], y[j].im);
+                }
+                f_store(stage + 32u * b + 16u * (uint32_t)u, o);
+            }
+        }
+        for(uint32_t b = 0; b < M; ++b){
+            fcv s0 = f_load(stage + 32u * b);
+            fcv s1 = f_load(stage + 32u * b + 16u);
+            __m512i e0, c0, e1, c1;
+            f16_centered_corr(&e0, &c0, cx, kd[b], &S[b]);
+            f16_centered_corr(&e1, &c1, cx, kd[b] + 16, &S[b]);
+            kd[b] += 32;
+            f16_lohi q = f16_pack2i(
+                _mm512_add_epi64(f16_mround_s(s0.re), e0),
+                _mm512_add_epi64(f16_mround_s(s0.im), c0),
+                _mm512_add_epi64(f16_mround_s(s1.re), e1),
+                _mm512_add_epi64(f16_mround_s(s1.im), c1));
+            _mm512_mask_storeu_epi64((void*)r[b], f16_st_mask(rme[b]),
+                                     f16_chain_step(&ch[b], q));
+            r[b] += 8; rme[b] -= 8;
+            phi[b] = (phi[b] + 16u) % M;
+        }
+    }
+    for(uint32_t b = 0; b + 1u < M; ++b){
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[b].prev_hi + 56, 8);
+        unsigned __int128 c = (unsigned __int128)hi7 + ch[b].cin;
+        if((size_t)(b + 1u) * limbs_b >= (size_t)rl){ if(c) return 0; continue; }
+        uint64_t* q = rp + (size_t)(b + 1u) * limbs_b;
+        uint64_t* qe = rp + rl;
+        while(c && q < qe){ c += *q; *q++ = (uint64_t)c; c >>= 64; }
+        if(c) return 0;
+    }
+    {
+        uint64_t hi7;
+        memcpy(&hi7, (const char*)&ch[M - 1u].prev_hi + 56, 8);
+        if(hi7 + ch[M - 1u].cin != 0) return 0;
+    }
+    return 1;
+}
+/* PFA inverse butterfly to natural order (no pack): used by the centered
+ * band so the corrections run in the prefetch-friendly flat emit. dst must
+ * not alias data (the spare spectrum buffer serves). */
+__attribute__((always_inline))
+static inline void f16_pfa_natural_impl(double* dst, const double* data,
+                                        uint32_t n, uint32_t M){
+    uint8_t km[8]; f16_kmasks(km, M);
+    const double* br[7]; double* w[7]; uint32_t phi[7];
+    for(uint32_t b = 0; b < M; ++b){
+        br[b]  = data + 2u * (size_t)n * b;
+        w[b]   = dst + 2u * (size_t)n * b;
+        phi[b] = (uint32_t)(((uint64_t)b * n) % M);
+    }
+    for(uint32_t t = 0; t < n / 8u; ++t){
+        fcv x[7], y[7];
+        for(uint32_t b = 0; b < M; ++b){
+            x[b] = f_load(br[b]);
+            br[b] += 16;
+        }
+        f16_pfa_bfly(x, y, M, 1);
+        for(uint32_t b = 0; b < M; ++b){
+            fcv o = y[0];
+            for(uint32_t j = 0; j < M; ++j){
+                uint32_t dd = (j + M - phi[b]) % M;
+                o.re = _mm512_mask_mov_pd(o.re, km[dd], y[j].re);
+                o.im = _mm512_mask_mov_pd(o.im, km[dd], y[j].im);
+            }
+            f_store(w[b], o);
+            w[b] += 16;
+            phi[b] = (phi[b] + 8u) % M;
+        }
+    }
+}
+static inline void f16_pfa_natural(double* dst, const double* data,
+                                   uint32_t n, uint32_t M){
+    switch(M){
+    case 3:  f16_pfa_natural_impl(dst, data, n, 3u); break;
+    case 5:  f16_pfa_natural_impl(dst, data, n, 5u); break;
+    default: f16_pfa_natural_impl(dst, data, n, 7u); break;
+    }
+}
+
+static inline int f16_pfa_emit_c(uint64_t* rp, int64_t rl, double* data,
+                                 uint32_t n,
+                                 uint32_t M, const f16_plan* pl,
+                                 const f16_cctx* cx){
+    switch(M){
+    case 3:  return f16_pfa_emit_c_impl(rp, rl, data, n, 3u, pl, cx);
+    case 5:  return f16_pfa_emit_c_impl(rp, rl, data, n, 5u, pl, cx);
+    default: return f16_pfa_emit_c_impl(rp, rl, data, n, 7u, pl, cx);
+    }
+}
+
+static inline int f16_pfa_emit(uint64_t* rp, int64_t rl, double* data,
+                               uint32_t n,
                                uint32_t M, const f16_plan* pl){
     switch(M){
-    case 3:  return F16_PFA3X2 ? f16_pfa3x2_emit(rp, data, n, pl)
-                               : f16_pfa_emit_impl(rp, data, n, 3u, pl);
+    case 3:  return F16_PFA3X2 ? f16_pfa3x2_emit(rp, rl, data, n, pl)
+                               : f16_pfa_emit_impl(rp, rl, data, n, 3u, pl);
 #if F16_PFA_EMIT_ROT
-    case 5:  return f16_pfa_emit_rot(rp, data, n, 5u, pl->wt5, pl);
-    default: return f16_pfa_emit_rot(rp, data, n, 7u, pl->wt7, pl);
+    case 5:  return f16_pfa_emit_rot(rp, rl, data, n, 5u, pl->wt5, pl);
+    default: return f16_pfa_emit_rot(rp, rl, data, n, 7u, pl->wt7, pl);
 #else
-    case 5:  return f16_pfa_emit_tw(rp, data, n, 5u, pl->wt5, pl);
-    default: return f16_pfa_emit_tw(rp, data, n, 7u, pl->wt7, pl);
+    case 5:  return f16_pfa_emit_tw(rp, rl, data, n, 5u, pl->wt5, pl);
+    default: return f16_pfa_emit_tw(rp, rl, data, n, 7u, pl->wt7, pl);
 #endif
     }
 }
@@ -2007,8 +2641,22 @@ static _Thread_local f16_plan f16_tls;
 #ifndef F16_PFA7_MIN_BRANCH
 #define F16_PFA7_MIN_BRANCH 128u
 #endif
+/* largest supported transform (complex points); probed empirically with
+ * adversarial all-max-digit operands: pow2 and PFA-3/5 hold to 2^17, the
+ * direct-form radix-7 butterfly's longer FMA chains break first at
+ * N = 7*2^14, so PFA-7 is precision-capped at 2^16. */
+#ifndef F16_MAX_N
+#define F16_MAX_N (1u << 17)
+#endif
+#ifndef F16_PFA7_MAX_N
+#define F16_PFA7_MAX_N (1u << 16)
+#endif
 typedef struct { uint32_t nfull, branch, M; } f16_size;
-static inline f16_size f16_choose(uint32_t need){
+/* maxn = band cap (F16_MAX_N uncentered, F16_MAX_N_C centered). The PFA-7
+ * precision gate applies only uncentered: the direct-form radix-7 fails
+ * first at 7*2^14 on max-digit input, but the centered headroom admits it
+ * through the full band (probed at 7*2^15 and 7*2^16). */
+static inline f16_size f16_choose(uint32_t need, uint32_t maxn, int cen){
     uint32_t p2 = 512;
     while(p2 < need) p2 <<= 1;
     f16_size best = { p2, p2, 1 };
@@ -2018,42 +2666,78 @@ static inline f16_size f16_choose(uint32_t need){
         uint32_t br = M == 3 ? 256u : 128u;
         while(M * br < need) br <<= 1;
         if(M == 7u && br < F16_PFA7_MIN_BRANCH) continue;
-        if(M * br < best.nfull && M * br <= (1u << 16)){
+        if(M == 7u && !cen && M * br > F16_PFA7_MAX_N) continue;
+        if(M * br < best.nfull && M * br <= maxn){
             best.nfull = M * br; best.branch = br; best.M = M;
         }
     }
     return best;
 }
 
+/* centered band: transforms above F16_MAX_N up to F16_MAX_N_C run on
+ * centered digits (4x precision headroom); probed empirically. */
+#ifndef F16_MAX_N_C
+#define F16_MAX_N_C (1u << 19)
+#endif
 static inline int fft16_mul(uint64_t* rp,
                             const uint64_t* ap, ptrdiff_t an,
                             const uint64_t* bp, ptrdiff_t bn){
     if(an <= 0 || bn <= 0) return 0;
     uint64_t need = 2u * ((uint64_t)an + (uint64_t)bn);   /* complex points */
-    if(need > (1u << 16)) return 0;                        /* U16 precision cap */
-    f16_size fs = f16_choose((uint32_t)need);
+    const int cen = F16_FORCE_CENTERED || need > F16_MAX_N;
+    const uint32_t maxn = cen ? F16_MAX_N_C : F16_MAX_N;
+    if(need > maxn) return 0;                              /* precision cap */
+    f16_size fs = f16_choose((uint32_t)need, maxn, cen);
     const uint32_t n = fs.branch, M = fs.M, nfull = fs.nfull;
 
     f16_plan* pl = &f16_tls;
     f16_plan_ensure(pl, n, nfull);
 
-    memcpy(pl->pada, ap, (size_t)an * 8);
-    memset(pl->pada + an, 0, ((size_t)(nfull / 2u) - (size_t)an) * 8);
-    memcpy(pl->padb, bp, (size_t)bn * 8);
-    memset(pl->padb + bn, 0, ((size_t)(nfull / 2u) - (size_t)bn) * 8);
+    const int64_t rl = (int64_t)(an + bn);
+    f16_cctx cx = { (const uint16_t*)ap, (const uint16_t*)bp,
+                    4 * (int64_t)an, 4 * (int64_t)bn, 0 };
 
     /* B first so A's spectrum is the cache-hot one when pointwise consumes
-     * and overwrites it; leaves are fused into the pointwise pass. */
+     * and overwrites it; leaves are fused into the pointwise pass. Inputs
+     * are read directly (masked tails); centering rides the raw loads. */
+    const uint64_t XC = 0x8000800080008000ull;
+    if(cen){
+        for(int64_t i = 0; i < an; ++i) pl->pca[i] = ap[i] ^ XC;
+        memset(pl->pca + an, 0, ((size_t)(nfull / 2u) - (size_t)an) * 8);
+        for(int64_t i = 0; i < bn; ++i) pl->pcb[i] = bp[i] ^ XC;
+        memset(pl->pcb + bn, 0, ((size_t)(nfull / 2u) - (size_t)bn) * 8);
+        cx.a = (const uint16_t*)pl->pca;
+        cx.b = (const uint16_t*)pl->pcb;
+        cx.xored = 1;
+    }
     if(M == 1){
-        f16_fwd(pl->db, pl->padb, n, pl);
-        f16_fwd(pl->da, pl->pada, n, pl);
+        if(cen){
+            f16_input_stage(pl->db, pl->pcb, (int64_t)(nfull / 2u), n, pl, 2);
+            f16_fwd_core(pl->db, n, pl);
+            f16_input_stage(pl->da, pl->pca, (int64_t)(nfull / 2u), n, pl, 2);
+            f16_fwd_core(pl->da, n, pl);
+        }else{
+            f16_fwd(pl->db, bp, bn, n, pl);
+            f16_fwd(pl->da, ap, an, n, pl);
+        }
         f16_pointwise_mul_ileaves(pl->da, pl->db, n, 1.0 / (double)n,
                                   f16_shape_of(n).leaf, pl);
         f16_inv_r8_only(pl->da, n, pl);
-        if(!f16_inv_final_emit(pl->padr, pl->da, n, pl)) return 0;
+        if(cen){
+            f16_mem_ir22(pl->da, n, pl->tw22[__builtin_ctz(n)]);
+            if(!f16_emit_c_flat(pl->pcr, rl, pl->da, n, &cx)) return 0;
+            memcpy(rp, pl->pcr, (size_t)rl * 8);
+        }else{
+            if(!f16_inv_final_emit(rp, rl, pl->da, n, pl)) return 0;
+        }
     }else{
-        f16_pfa_fwd(pl->db, pl->padb, n, M, pl);
-        f16_pfa_fwd(pl->da, pl->pada, n, M, pl);
+        if(cen){
+            f16_pfa_fwd_x(pl->db, pl->pcb, (int64_t)(nfull / 2u), n, M, pl, 2);
+            f16_pfa_fwd_x(pl->da, pl->pca, (int64_t)(nfull / 2u), n, M, pl, 2);
+        }else{
+            f16_pfa_fwd(pl->db, bp, bn, n, M, pl);
+            f16_pfa_fwd(pl->da, ap, an, n, M, pl);
+        }
         const double sc = 1.0 / (double)nfull;
         const double* wrt = M == 3 ? F16_W3_RE : M == 5 ? F16_W5_RE : F16_W7_RE;
         const double* wit = M == 3 ? F16_W3_IM : M == 5 ? F16_W5_IM : F16_W7_IM;
@@ -2080,10 +2764,14 @@ static inline int fft16_mul(uint64_t* rp,
                 f16_mem_ir22(d, n, tw);
             }
         }
-        if(!f16_pfa_emit(pl->padr, pl->da, n, M, pl)) return 0;
+        if(cen){
+            f16_pfa_natural(pl->db, pl->da, n, M);
+            if(!f16_emit_c_flat(pl->pcr, rl, pl->db, (uint32_t)(M * n), &cx)) return 0;
+            memcpy(rp, pl->pcr, (size_t)rl * 8);
+        }else{
+            if(!f16_pfa_emit(rp, rl, pl->da, n, M, pl)) return 0;
+        }
     }
-    memcpy(rp, pl->padr, (size_t)(an + bn) * 8);
     return 1;
 }
-
 #endif /* FFT16_H */

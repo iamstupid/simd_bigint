@@ -17,7 +17,7 @@
 #define borrow_prop(r, a, b, carry, ...) carry_prop_t(sub, add, zero(), r, a, b, carry, ##__VA_ARGS__)
 
 #define canonize(vec, carry, sigcarry) do {                         \
-    static const _vec M = MASK52;\
+    const _vec M = MASK52;\
     _vec hi  = srli(vec, 52);                /* full per-lane overflow */ \
     _vec his = alignr64(hi, carry, 7);       /* hi[i-1]; lane0 <- carry[7] */ \
     _vec _canon_t = add(and_v(vec, M), his); /* low + carry-in, < 2^53 */ \

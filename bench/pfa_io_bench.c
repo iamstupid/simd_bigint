@@ -131,12 +131,12 @@ static int pfa_emit_B7(uint64_t* r, double* d, uint32_t n, const f16_plan* pl){ 
 typedef void (*infn)(double*, const uint64_t*, uint32_t, const f16_plan*);
 typedef int  (*emfn)(uint64_t*, double*, uint32_t, const f16_plan*);
 
-static void inA3(double* d, const uint64_t* s, uint32_t n, const f16_plan* pl){ f16_pfa_input_impl(d, s, n, 3, pl); }
-static void inA5(double* d, const uint64_t* s, uint32_t n, const f16_plan* pl){ f16_pfa_input_impl(d, s, n, 5, pl); }
-static void inA7(double* d, const uint64_t* s, uint32_t n, const f16_plan* pl){ f16_pfa_input_impl(d, s, n, 7, pl); }
-static int emA3(uint64_t* r, double* d, uint32_t n, const f16_plan* pl){ return f16_pfa_emit_impl(r, d, n, 3, pl); }
-static int emA5(uint64_t* r, double* d, uint32_t n, const f16_plan* pl){ return f16_pfa_emit_impl(r, d, n, 5, pl); }
-static int emA7(uint64_t* r, double* d, uint32_t n, const f16_plan* pl){ return f16_pfa_emit_impl(r, d, n, 7, pl); }
+static void inA3(double* d, const uint64_t* s, uint32_t n, const f16_plan* pl){ f16_pfa_input_impl(d, s, (int64_t)n * 3 / 2, n, 3, pl, 0); }
+static void inA5(double* d, const uint64_t* s, uint32_t n, const f16_plan* pl){ f16_pfa_input_impl(d, s, (int64_t)n * 5 / 2, n, 5, pl, 0); }
+static void inA7(double* d, const uint64_t* s, uint32_t n, const f16_plan* pl){ f16_pfa_input_impl(d, s, (int64_t)n * 7 / 2, n, 7, pl, 0); }
+static int emA3(uint64_t* r, double* d, uint32_t n, const f16_plan* pl){ return f16_pfa_emit_impl(r, (int64_t)n * 3 / 2, d, n, 3, pl); }
+static int emA5(uint64_t* r, double* d, uint32_t n, const f16_plan* pl){ return f16_pfa_emit_impl(r, (int64_t)n * 5 / 2, d, n, 5, pl); }
+static int emA7(uint64_t* r, double* d, uint32_t n, const f16_plan* pl){ return f16_pfa_emit_impl(r, (int64_t)n * 7 / 2, d, n, 7, pl); }
 
 int main(void){
     f16_plan* pl = &f16_tls;
@@ -153,9 +153,10 @@ int main(void){
             uint32_t n = brs[bi], nfull = M * n;
             f16_plan_ensure(pl, n, nfull);
             size_t limbs = nfull / 2u;
-            for(size_t i = 0; i < limbs; ++i) pl->pada[i] = xr();
-            pl->pada[limbs - 1] = 0;     /* M*digit must not carry out the top */
-            uint64_t* refr = pl->padb;   /* borrow as reference output buf */
+            static uint64_t PA[1<<19], PR[1<<19], PB2[1<<19];
+            for(size_t i = 0; i < limbs; ++i) PA[i] = xr();
+            PA[limbs - 1] = 0;     /* M*digit must not carry out the top */
+            uint64_t* refr = PB2;
 
             /* validation: input variant -> emit variant == M * digits.
              * M * digit stream as limbs: digits are u16; M*d < 2^19 so the
@@ -163,15 +164,15 @@ int main(void){
             int bad = 0;
             for(int iv = 0; iv < 2 && !bad; ++iv)
                 for(int ev = 0; ev < 2 && !bad; ++ev){
-                    (iv ? inB[mi] : inA[mi])(pl->da, pl->pada, n, pl);
-                    if(!(ev ? emB[mi] : emA[mi])(pl->padr, pl->da, n, pl)){
+                    (iv ? inB[mi] : inA[mi])(pl->da, PA, n, pl);
+                    if(!(ev ? emB[mi] : emA[mi])(PR, pl->da, n, pl)){
                         printf("M=%u br=%u iv=%d ev=%d carry fail\n", M, n, iv, ev);
                         bad = 1; break;
                     }
                     /* reference: per digit d -> M*d, repacked */
                     unsigned __int128 c = 0;
                     for(size_t i = 0; i < limbs; ++i){
-                        uint64_t L = pl->pada[i];
+                        uint64_t L = PA[i];
                         unsigned __int128 v = c;
                         v += (unsigned __int128)(uint64_t)(M * (L & 0xFFFFu));
                         v += (unsigned __int128)(uint64_t)(M * ((L >> 16) & 0xFFFFu)) << 16;
@@ -181,7 +182,7 @@ int main(void){
                         c = v >> 64;
                     }
                     for(size_t i = 0; i < limbs; ++i)
-                        if(pl->padr[i] != refr[i]){
+                        if(PR[i] != refr[i]){
                             printf("MISMATCH M=%u br=%u iv=%d ev=%d limb=%zu\n",
                                    M, n, iv, ev, i);
                             bad = 1; break;
@@ -193,13 +194,13 @@ int main(void){
             double ta[4][PASSES];
             for(int p = 0; p < PASSES; ++p){
                 double t0;
-                t0 = now(); for(long q = 0; q < reps; ++q) inA[mi](pl->da, pl->pada, n, pl);
+                t0 = now(); for(long q = 0; q < reps; ++q) inA[mi](pl->da, PA, n, pl);
                 ta[0][p] = (now() - t0) / reps;
-                t0 = now(); for(long q = 0; q < reps; ++q) inB[mi](pl->da, pl->pada, n, pl);
+                t0 = now(); for(long q = 0; q < reps; ++q) inB[mi](pl->da, PA, n, pl);
                 ta[1][p] = (now() - t0) / reps;
-                t0 = now(); for(long q = 0; q < reps; ++q) emA[mi](pl->padr, pl->da, n, pl);
+                t0 = now(); for(long q = 0; q < reps; ++q) emA[mi](PR, pl->da, n, pl);
                 ta[2][p] = (now() - t0) / reps;
-                t0 = now(); for(long q = 0; q < reps; ++q) emB[mi](pl->padr, pl->da, n, pl);
+                t0 = now(); for(long q = 0; q < reps; ++q) emB[mi](PR, pl->da, n, pl);
                 ta[3][p] = (now() - t0) / reps;
             }
             double med[4];

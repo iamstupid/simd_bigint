@@ -3,7 +3,7 @@
 #include "assert.h"
 #include "scratch.h"
 #include "canon.h"
-#include <cstdint>
+#include <stdint.h>
 
 static inline __mmask8 u52_limb_mask(uint64_t n) {
     const uint64_t r = n & 7;

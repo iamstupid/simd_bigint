@@ -3,6 +3,8 @@
 #include <immintrin.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdalign.h>   /* alignas: macro in C11/C17, keyword in C23/C++ */
+#include <stdbool.h>    /* bool/true/false: macros in C11/C17, keywords in C23/C++ */
 #include <string.h>
 
 typedef uint64_t _limb;
