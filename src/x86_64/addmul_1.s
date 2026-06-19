@@ -1,0 +1,166 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   
+   
+   
+   
+
+
+
+
+
+      
+      
+      
+
+
+
+
+
+
+
+
+
+	.text
+	.align	16, 0x90
+	.globl	sbn_addmul_1
+		.type	sbn_addmul_1,@function
+	
+sbn_addmul_1:
+
+	
+	mov	(%rsi), %r8
+
+	push	%rbx
+	push	%r12
+	push	%r13
+
+	lea	(%rsi,%rdx,8), %rsi
+	lea	-32(%rdi,%rdx,8), %rdi
+	mov	%edx, %eax
+	xchg	%rcx, %rdx		
+
+	neg	%rcx
+
+	and	$3, %al
+	jz	.Lb0
+	cmp	$2, %al
+	jz	.Lb2
+	jg	.Lb3
+
+.Lb1:	.byte	0xc4,194,227,0xf6,192
+	sub	$-1, %rcx
+	jz	.Lwd1
+	.byte	0xc4,0x62,0xb3,0xf6,0x04,0xce		
+	.byte	0xc4,0x62,0xa3,0xf6,0x54,0xce,0x08	
+	test	%eax, %eax		
+	jmp	.Llo1
+
+.Lb0:	.byte	0xc4,66,179,0xf6,192
+	.byte	0xc4,0x62,0xa3,0xf6,0x54,0xce,0x08	
+	.byte	0xc4,0x62,0x93,0xf6,0x64,0xce,0x10	
+	xor	%eax, %eax
+	jmp	.Llo0
+
+.Lb3:	.byte	0xc4,66,163,0xf6,208
+	.byte	0xc4,0x62,0x93,0xf6,0x64,0xce,0x08	
+	.byte	0xc4,0xe2,0xe3,0xf6,0x44,0xce,0x10	
+	add	%r10, %r13
+	adc	%r12, %rbx
+	adc	$0, %rax
+	sub	$-3, %rcx
+	jz	.Lwd3
+	test	%eax, %eax		
+	jmp	.Llo3
+
+.Lb2:	.byte	0xc4,66,147,0xf6,224
+	.byte	0xc4,0xe2,0xe3,0xf6,0x44,0xce,0x08	
+	add	%r12, %rbx
+	adc	$0, %rax
+	sub	$-2, %rcx
+	jz	.Lwd2
+	.byte	0xc4,0x62,0xb3,0xf6,0x04,0xce		
+	test	%eax, %eax		
+	jmp	.Llo2
+
+.Ltop:	add	%r9, (%rdi,%rcx,8)
+.Llo3:	.byte	0xc4,0x62,0xb3,0xf6,0x04,0xce		
+	adc	%r11, 8(%rdi,%rcx,8)
+.Llo2:	.byte	0xc4,0x62,0xa3,0xf6,0x54,0xce,0x08	
+	adc	%r13, 16(%rdi,%rcx,8)
+.Llo1:	.byte	0xc4,0x62,0x93,0xf6,0x64,0xce,0x10	
+	adc	%rbx, 24(%rdi,%rcx,8)
+	adc	%rax, %r9
+.Llo0:	.byte	0xc4,0xe2,0xe3,0xf6,0x44,0xce,0x18	
+	adc	%r8, %r11
+	adc	%r10, %r13
+	adc	%r12, %rbx
+	adc	$0, %rax		
+	add	$4, %rcx
+	js	.Ltop
+
+.Lend:	add	%r9, (%rdi)
+.Lwd3:	adc	%r11, 8(%rdi)
+.Lwd2:	adc	%r13, 16(%rdi)
+.Lwd1:	adc	%rbx, 24(%rdi)
+	adc	%rcx, %rax
+	pop	%r13
+	pop	%r12
+	pop	%rbx
+	
+	ret
+		.size	sbn_addmul_1,.-sbn_addmul_1
+

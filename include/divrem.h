@@ -192,26 +192,21 @@ static inline void u52_from_u64_lsh(pvec r, const uint64_t* ap, uint64_t an, uin
         store_vec((pvec)(out + 8*bi), and_v(srlv(alignr64(zero(), prev, 7), k52), M));
 }
 
-// r[0..n) = a[0..n] >> s   (reads a[w .. w+n]; caller zero-pads beyond; r may alias a).
-static inline void mpn_rshift_simd(uint64_t* r, const uint64_t* a, uint64_t n, uint64_t s){
-    const uint64_t w = s >> 6; const unsigned b = (unsigned)(s & 63);
-    const uint64_t* ap = a + w;
-    if(b == 0){
-        uint64_t i = 0;
-        for(; i + 8 <= n; i += 8) store_vec((pvec)(r+i), load_vec((cpvec)(ap+i)));
-        if(i < n){ __mmask8 m = (__mmask8)((1u << (n-i)) - 1);
-                   store_vec((pvec)(r+i), load_vec((cpvec)(ap+i), m), m); }
-        return;
+// out[0..blocks) = (src as u52 number) >> s, in u52 digits.  Mirror of the
+// fused decode-shift: digit offset kd = s/52, sub-digit funnel kb = s%52.
+// Reads src[kd .. kd+8*blocks] (one digit past the last block -> caller
+// zero-pads that block).  In-place safe (out == src).
+static inline void u52_rshift(_limb* out, const _limb* src, uint64_t blocks, uint64_t s){
+    const uint64_t kd = s / 52; const unsigned kb = (unsigned)(s % 52);
+    const _vec kbv = set1_64(kb), k52 = set1_64(52 - kb), M = MASK52;
+    const _limb* sp = src + kd;
+    for(uint64_t bk = 0; bk < blocks; ++bk){
+        _vec cur = load_vec((cpvec)(sp + 8*bk));
+        _vec o = kb ? and_v(or_v(srlv(cur, kbv),
+                                 sllv(load_vec((cpvec)(sp + 8*bk + 1)), k52)), M)
+                    : cur;                            // (cur>>kb)|(next<<(52-kb))
+        store_vec((pvec)(out + 8*bk), o);
     }
-    const _vec cb = set1_64(b);
-    uint64_t i = 0;
-    for(; i + 8 <= n; i += 8){
-        _vec cur = load_vec((cpvec)(ap+i)), above = load_vec((cpvec)(ap+i+1));
-        store_vec((pvec)(r+i), fshr64v(cur, above, cb));     // (cur>>b)|(above<<(64-b))
-    }
-    if(i < n){ __mmask8 m = (__mmask8)((1u << (n-i)) - 1);
-        _vec cur = load_vec((cpvec)(ap+i), m), above = load_vec((cpvec)(ap+i+1), m);
-        store_vec((pvec)(r+i), fshr64v(cur, above, cb), m); }
 }
 
 // Quotient Q = floor(N/D), remainder R = N mod D, on packed u64 limbs.
@@ -246,7 +241,7 @@ static inline void divrem_u64(uint64_t* qp, uint64_t* rp,
     // blocks; N's block above the remainder is zeroed for the same reason.
     pvec D52 = SALLOC0(sc, _vec, dn + 1);
     pvec N52 = SALLOC0(sc, _vec, nn);
-    pvec Q52 = SALLOC0(sc, _vec, qn + 1);
+    pvec Q52 = SALLOC0(sc, _vec, qn + 2);   // +slack: the value-sized convert may read qn+1 blocks
     u52_from_u64_lsh(D52, dp, dn64, s);
     u52_from_u64_lsh(N52, np, nn64, s);
 
@@ -267,23 +262,20 @@ static inline void divrem_u64(uint64_t* qp, uint64_t* rp,
 
     divrem_core((_limb*)Q52, (_limb*)N52, nn, (const _limb*)D52, dn, v);
 
-    // quotient u52 -> u64
-    const uint64_t Ql = (416 * qn + 63) / 64;
-    uint64_t* Qb = SALLOC0(sc, uint64_t, Ql + 1);
-    u64_from_u52_canon(Qb, (cpvec)Q52, Ql);
-    uint64_t qn64 = Ql; while(qn64 && Qb[qn64-1] == 0) --qn64; if(!qn64) qn64 = 1;
-    for(uint64_t i = 0; i < qn64; i++) qp[i] = Qb[i];
+    // quotient: encode straight into qp, sized to the value (nn64-dn64+1 limbs,
+    // the caller's contract) rather than the 416-bit block span.  Q < 2^(64*qm)
+    // so its high u52 digits are zero and the conversion truncates nothing.
+    const uint64_t qm = nn64 - dn64 + 1;
+    u64_from_u52_canon(qp, (cpvec)Q52, qm);
+    uint64_t qn64 = qm; while(qn64 && qp[qn64-1] == 0) --qn64; if(!qn64) qn64 = 1;
     *qn64_out = qn64;
 
-    // remainder: low dn blocks of N52 hold R<<s ; convert then right-shift by s.
-    // zero the block above the remainder so the conversion's over-read is clean.
-    memset((_limb*)N52 + 8*dn, 0, 8 * 8);
-    const uint64_t Rl = (416 * dn + 63) / 64;
-    uint64_t* Rb = SALLOC0(sc, uint64_t, Rl + (s >> 6) + 2);  // zero-padded for rshift
-    u64_from_u52_canon(Rb, (cpvec)N52, Rl);
-    mpn_rshift_simd(Rb, Rb, dn64, s);           // R = (R<<s) >> s, low dn64 limbs
-    uint64_t rn64 = dn64; while(rn64 && Rb[rn64-1] == 0) --rn64; if(!rn64) rn64 = 1;
-    for(uint64_t i = 0; i < dn64; i++) rp[i] = Rb[i];
+    // remainder: low dn blocks of N52 hold R<<s.  Funnel >>s in u52 (in place),
+    // then encode straight into rp -- no staging buffer, no u64 shift.
+    memset((_limb*)N52 + 8*dn, 0, 8 * 8);       // zero the funnel's over-read digit
+    u52_rshift((_limb*)N52, (_limb*)N52, dn, s);
+    u64_from_u52_canon(rp, (cpvec)N52, dn64);
+    uint64_t rn64 = dn64; while(rn64 && rp[rn64-1] == 0) --rn64; if(!rn64) rn64 = 1;
     *rn64_out = rn64;
 }
 
