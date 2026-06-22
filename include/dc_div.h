@@ -146,4 +146,65 @@ static int blk_dcpi1_div_qr(_limb* qp, _limb* np, uint64_t nn, const _limb* dp, 
     return qh;
 }
 
+// ===================== u64 wrapper (D&C core) =====================
+// Same packed-u64 contract as divrem.h's divrem_u64, but the normalized division
+// uses the sub-quadratic blk_dcpi1_div_qr above (falling back to the schoolbook
+// divrem_core when dn < DC_THRESHOLD).  Reuses all of divrem.h's conversion
+// machinery (u52_from_u64_lsh / u52_rshift / recip seed / u64_from_u52_canon).
+static void divrem_u64_dc(uint64_t* qp, uint64_t* rp,
+                          const uint64_t* np, uint64_t nn64,
+                          const uint64_t* dp, uint64_t dn64,
+                          uint64_t* qn64_out, uint64_t* rn64_out){
+    const uint64_t Dbits = u64_bit_length(dp, dn64);
+    const uint64_t Nbits = u64_bit_length(np, nn64);
+    if(Nbits < Dbits){
+        for(uint64_t i = 0; i < dn64; i++) rp[i] = (i < nn64) ? np[i] : 0;
+        qp[0] = 0; *qn64_out = 1; *rn64_out = dn64;
+        return;
+    }
+    const uint64_t dn = (Dbits + 415) / 416;
+    const uint64_t s  = 416 * dn - Dbits;
+    const uint64_t Nb = Nbits + s;
+    const uint64_t nn = (Nb + 415) / 416 + 1;
+    const uint64_t qn = nn - dn;
+
+    scratch* sc = scratch_thread();
+    SCRATCH(sc);
+
+    pvec D52 = SALLOC0(sc, _vec, dn + 1);
+    pvec N52 = SALLOC0(sc, _vec, nn);
+    pvec Q52 = SALLOC0(sc, _vec, qn + 2);
+    u52_from_u64_lsh(D52, dp, dn64, s);
+    u52_from_u64_lsh(N52, np, nn64, s);
+
+    uint64_t I13[13] = {0};
+    {
+        const unsigned cl = (unsigned)__builtin_clzll(dp[dn64-1]);
+        _vec top8 = (dn64 >= 8)
+            ? load_vec((cpvec)(dp + dn64 - 8))
+            : alignr64(load_vec((cpvec)dp, (__mmask8)0x7f), zero(), 7);
+        _vec norm = fshl64v(top8, alignr64(top8, zero(), 7), set1_64(cl));
+        store_vec((pvec)(I13 + 5), norm);
+    }
+    _vec v = recip_3by2_seed(I13);
+
+    if(dn < DC_THRESHOLD){
+        divrem_core((_limb*)Q52, (_limb*)N52, nn, (const _limb*)D52, dn, v);
+    } else {
+        pvec tp = SALLOC0(sc, _vec, dn + 1);     // cross-product scratch (<= dn blocks)
+        blk_dcpi1_div_qr((_limb*)Q52, (_limb*)N52, nn, (const _limb*)D52, dn, v, (_limb*)tp);
+    }
+
+    const uint64_t qm = nn64 - dn64 + 1;
+    u64_from_u52_canon(qp, (cpvec)Q52, qm);
+    uint64_t qn64 = qm; while(qn64 && qp[qn64-1] == 0) --qn64; if(!qn64) qn64 = 1;
+    *qn64_out = qn64;
+
+    memset((_limb*)N52 + 8*dn, 0, 8 * 8);
+    u52_rshift((_limb*)N52, (_limb*)N52, dn, s);
+    u64_from_u52_canon(rp, (cpvec)N52, dn64);
+    uint64_t rn64 = dn64; while(rn64 && rp[rn64-1] == 0) --rn64; if(!rn64) rn64 = 1;
+    *rn64_out = rn64;
+}
+
 #undef INLINE
