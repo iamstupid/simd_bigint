@@ -122,4 +122,187 @@ static inline void mulmid_basecase(plimb r, const _limb *a, const _limb *b, int6
             // tail
         }
     }
+    #undef mm_acc
+    #undef mm_acc_2
+}
+
+static inline void midmul_basecase_simple(plimb r, const _limb *a, const _limb *b, int64_t an, int64_t bn){
+    // A simpler version with unaligned vectors (load, then valignq-ed into unaligned)
+    // should be a bit faster with smaller inputs
+    // due to no shape loss
+    _vec acc[8], b0, b1, sum, sum1, last1 = zero();
+    // acc[i] is basically, only for dependency elimination
+    // acc[even] is aligned  acc lo
+    // acc[ odd] is off-by-1 acc hi
+    const int64_t rn = bn - an + 1;
+    #define mm_acc(ind) {\
+        const _vec _v = alignr64(b1, b0, ind); \
+        const _vec _a = splat_load(aptr, 7 - ind); \
+        acc[(ind&3)*2  ] = madd52lo(acc[(ind&3)*2  ] , _v, _a); \
+        acc[(ind&3)*2+1] = madd52hi(acc[(ind&3)*2+1] , _v, _a); \
+    }
+    for(int64_t i = 0; i < rn; i += 8){
+        const _limb *bptr = b + i;
+        sum = zero(); sum1 = zero();
+        for(int _ = 0; _ < 8; ++_) acc[_] = zero();
+        b0 = load_vec(bptr);
+        for(int64_t j = an; j > 0; j -= 8){
+            const _limb *aptr = a + (j-8);
+            b1 = load_vec(bptr += 8);
+            if(j <= 8) switch(j){
+                full:
+                case 8: mm_acc(7);
+                case 7: mm_acc(6);
+                case 6: mm_acc(5);
+                case 5: mm_acc(4);
+                case 4: mm_acc(3);
+                case 3: mm_acc(2);
+                case 2: mm_acc(1);
+                case 1: mm_acc(0);
+            }else goto full;
+            b0 = b1;
+        }
+        acc[5] = add(acc[5], acc[7]);
+        acc[4] = add(acc[4], acc[6]);
+        acc[1] = add(acc[3], acc[1]);
+        acc[0] = add(acc[2], acc[0]);
+        acc[1] = add(acc[5], acc[1]);
+        acc[0] = add(acc[4], acc[0]);
+        if(i + 8 < rn){
+            store_vec(r, add(acc[0], alignr64(acc[1], last1, 7)));
+            r+=8;
+            last1 = acc[1];
+        }else{
+            _vec hi1 = alignr64(acc[1], last1, 7);
+            const uint8_t mask = uint8_t((1 << (rn - i)) - 1);
+            const uint8_t write_mask = uint8_t((1 << (rn - i + 1)) - 1);
+            _vec re1 = add(hi1, acc[0], mask, hi1);
+            store_vec(r, re1, write_mask);
+            if(rn == i + 8) store_vec(r+1, acc[1], 0x80);
+        }
+    }
+    #undef mm_acc
+}
+
+static inline void midmul_basecase_simple_wtail(plimb r, const _limb *a, const _limb *b, int64_t an, int64_t bn){
+    // A simpler version with unaligned vectors (load, then valignq-ed into unaligned)
+    // should be a bit faster with smaller inputs
+    // due to no shape loss
+    _vec acc[8], b0, b1, last1 = zero(), lo = zero(), hi = zero(), hi1 = zero();
+    // acc[i] is basically, only for dependency elimination
+    // acc[even] is aligned  acc lo
+    // acc[ odd] is off-by-1 acc hi
+    const int64_t rn = bn - an + 1;
+    #define mm_acc(ind) {\
+        const _vec _v = alignr64(b1, b0, ind); \
+        const _vec _a = splat_load(aptr, 7 - ind); \
+        acc[(ind&3)*2  ] = madd52lo(acc[(ind&3)*2  ] , _v, _a); \
+        acc[(ind&3)*2+1] = madd52hi(acc[(ind&3)*2+1] , _v, _a); \
+    }
+    for(int64_t i = 0; i < rn; i += 8){
+        const _limb *bptr = b + i, *aptr;
+        for(int _ = 0; _ < 8; ++_) acc[_] = zero();
+        int64_t j = an;
+        {
+            if(i+8 <= rn){
+                b0 = load_vec(bptr);
+            }else{
+                // i+8 > rn: only one non-full block left
+                // We only pre-process the tail block, which
+                // we can't process it vertically.
+                j = an & 7; bptr += an - j;
+                b0 = load_vec(bptr); b1 = load_vec(bptr + 8);
+                aptr = a + j - 8;
+                if(j) goto htail; else{
+                    // the last block is also full
+                    // we skip over all the unnecessary compute
+                    // directly into vertical sums part
+                    lo = zero();
+                    hi1 = alignr64(zero(), last1, 7);
+                    goto vsums;
+                }
+            }
+            for(; j > 0; j -= 8){
+                aptr = a + (j-8);
+                b1 = load_vec(bptr += 8);
+                if(j <= 8){
+                    htail:
+                    switch(j){
+                        full:
+                        case 8: mm_acc(7);
+                        case 7: mm_acc(6);
+                        case 6: mm_acc(5);
+                        case 5: mm_acc(4);
+                        case 4: mm_acc(3);
+                        case 3: mm_acc(2);
+                        case 2: mm_acc(1);
+                        case 1: mm_acc(0);
+                    }
+                }else goto full;
+                b0 = b1;
+            }
+            acc[5] = add(acc[5], acc[7]);
+            acc[4] = add(acc[4], acc[6]);
+            acc[1] = add(acc[3], acc[1]);
+            acc[0] = add(acc[2], acc[0]);
+            acc[1] = add(acc[5], acc[1]);
+            acc[0] = add(acc[4], acc[0]);
+        }
+        if(i + 8 < rn){
+            store_vec(r, add(acc[0], alignr64(acc[1], last1, 7)));
+            r+=8;
+            last1 = acc[1];
+        }else{
+            lo = acc[0]; hi = acc[1];
+            hi1 = alignr64(hi, last1, 7);
+            if(i + 8 > rn){
+                // process the remaining parts
+                // accumulators now have different (vertical) semantics
+                // so we need to clean the accumulators
+                for(int _ = 0; _ < 8; ++_) acc[_] = zero();
+                vsums:
+                acc[8] = zero();
+                const _vec rev = setr_64(7,6,5,4,3,2,1,0);
+                const uint8_t sel_ni = rn - i; // [1,7]
+                bptr = b + i; b0 = load_vec(bptr);
+                for(j = an - 8; j >= 0; j -= 8){
+                    b1 = load_vec(bptr += 8);
+                    _vec ax = load_vec(a + j);
+                    ax = perm64(rev, ax); // ax is reverse a+j loaded
+                    #define mm_acc_2(ind) case ind: {\
+                        const _vec _v = alignr64(b1, b0, ind - 1); \
+                        acc[ind-1] = madd52lo(acc[ind-1], _v, ax); \
+                        acc[ ind ] = madd52hi(acc[ ind ], _v, ax); \
+                    }
+                    switch(sel_ni){
+                        mm_acc_2(7)
+                        mm_acc_2(6)
+                        mm_acc_2(5)
+                        mm_acc_2(4)
+                        mm_acc_2(3)
+                        mm_acc_2(2)
+                        mm_acc_2(1)
+                    }
+                    #undef mm_acc_2
+                    b0 = b1;
+                }
+                // batch vertical sum
+                // fixed cost
+                acc[0]=add(unpacklo64(acc[0], acc[1]), unpackhi64(acc[0], acc[1]));
+                acc[2]=add(unpacklo64(acc[2], acc[3]), unpackhi64(acc[2], acc[3]));
+                acc[4]=add(unpacklo64(acc[4], acc[5]), unpackhi64(acc[4], acc[5]));
+                acc[6]=add(unpacklo64(acc[6], acc[7]), unpackhi64(acc[6], acc[7]));
+                acc[0]=add(shufi64x2(acc[0], acc[2], 0x88), shufi64x2(acc[0], acc[2], 0xDD));
+                acc[4]=add(shufi64x2(acc[4], acc[6], 0x88), shufi64x2(acc[4], acc[6], 0xDD));
+                acc[0]=add(shufi64x2(acc[0], acc[4], 0x88), shufi64x2(acc[0], acc[4], 0xDD));
+                hi1 = add(hi1, acc[0]);
+            }
+            const uint8_t mask = uint8_t((1 << (rn - i)) - 1);
+            const uint8_t write_mask = uint8_t((1 << (rn - i + 1)) - 1);
+            _vec re1 = add(hi1, lo, mask, hi1);
+            store_vec(r, re1, write_mask);
+            if(rn == i + 8) store_vec(r+1, hi, 0x80);
+        }
+    }
+    #undef mm_acc
 }

@@ -222,6 +222,7 @@ typedef const vec_itype* cpvec;
 
 // Lane movement and full-vector permutes.
 #define alignr64(a, b, imm) vec_fn(alignr_epi64)((a), (b), (imm))
+// alignr = (concat(high = a, low = b) >> imm)[0..8]
 #define alignr8(...) CAT(alignr8_, NARGS(__VA_ARGS__))(__VA_ARGS__)
 #define alignr8_3(a, b, imm) vec_fn(alignr_epi8)((a), (b), (imm))
 #define alignr8_4(a, b, imm, mask)                                             \
@@ -236,6 +237,9 @@ typedef const vec_itype* cpvec;
 #define perm64(idx, a) vec_fn(permutexvar_epi64)((idx), (a))
 #define perm32(idx, a) vec_fn(permutexvar_epi32)((idx), (a))
 #define permb(idx, a) vec_fn(permutexvar_epi8)((idx), (a))
+#define unpacklo64(a, b) vec_fn(unpacklo_epi64)((a), (b))
+#define unpackhi64(a, b) vec_fn(unpackhi_epi64)((a), (b))
+#define shufi64x2(a, b, imm) vec_fn(shuffle_i64x2)((a), (b), (imm))
 
 // VBMI2 double shifts.  Immediate forms take an immediate shift count; variable
 // forms take a vector of per-lane counts.
